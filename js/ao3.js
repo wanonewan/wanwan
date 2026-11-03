@@ -153,6 +153,16 @@
     return { user, userName, chars, charNames: chars.map(charName), charBlocks, lore }
   }
 
+  // 文风规则：用正面写法 + 数量限制 + 对照例子（单纯写“禁止”几乎没用）
+  function styleRule() {
+    return '\n\n【文风要求（必须遵守，写作时随时对照）】\n' +
+      '1. 想说什么就直接说。不要先否定一个没人提过的说法，再补一句纠正。像“他不是生气，而是害怕”“这不是A，是B”“与其说A，不如说B”“没有A，只有B”这类对比转折句，整篇最多出现 2 处，且只能出现在真正需要对比的地方。\n' +
+      '   坏：他不是生气，而是害怕。 → 好：他的手指在杯沿上收紧，半天没松开。\n' +
+      '   坏：这不是安慰，是承诺。 → 好：她说：“以后我都在。”\n' +
+      '2. 不要写“怎么……怎么……”的排比句，也不要连续两句以上用同一种句式开头或收尾。句子长短、句式要有变化，像真人写的。\n' +
+      '3. 情绪用动作、细节、对白来呈现，不要替读者总结感悟，不要段末升华。'
+  }
+
   function systemPrompt(mode, ctx, work, chapN, per, startNo) {
     const themeText = (work.themeLines || []).length ? work.themeLines.join('；') : '不限（由你合理发挥）'
     const formatRule =
@@ -169,6 +179,7 @@
       (mode === 'continue' ? `\n这是续写：紧接上一章的剧情，不要复述旧章；本次续写必须围绕用户选定的「生成方向」展开。\n【防止绕圈】用户会给你「前情概要」，里面写过的场景、对话和桥段都不要再写一遍；每一章都必须出现新的事件、冲突、信息或关系变化，让剧情真正向前推进。` : '') +
       `\n你在这一次回复里写完全部章节，不要拆成多次。\n` +
       userCenteredRule(ctx.userName, ctx.charNames) +
+      styleRule() +
       (ctx.lore ? `\n\n【世界观参考】\n${ctx.lore}` : '') +
       `\n\n主题方向：${themeText}`
   }
@@ -180,7 +191,7 @@
       (work.prompt ? `创作备注：${work.prompt}\n` : '') +
       `\n【用户角色：${ctx.userName}】\n${(ctx.user && ctx.user.description) || '（未设定）'}\n\n${ctx.charBlocks}\n`
     if (mode === 'new') {
-      return head + `\n请自行拟定标题、关系、标签与摘要，并一次性写出全部 ${chapN} 章，最后给出 3 条续写方向。按系统提示的格式输出。`
+      return head + `\n请自行拟定标题、关系、标签与摘要，并一次性写出全部 ${chapN} 章，最后给出 3 条续写方向。按系统提示的格式输出。\n（写作提醒：直接陈述，少用“不是……而是……”对比句，不写“怎么……怎么……”排比。）`
     }
     const chaps = work.chapters || []
     const last = chaps[chaps.length - 1]
@@ -188,7 +199,7 @@
     if (tail.length > 700) tail = '…' + tail.slice(-700)
     return `作品标题：${work.title}\n摘要：${work.summary || ''}\n关系：${work.relationship || ''}\n` + head +
       `\n【前情概要（按章节顺序，以下剧情都已经发生过，不要重复）】\n${buildRecap(chaps)}\n\n【上一章的结尾（只用来衔接场景和语气，不要复述）】\n${tail}\n\n` +
-      `【本次选定的生成方向（必须作为续写主旨）】${direction}\n\n请从第 ${startNo} 章起，一次性续写 ${chapN} 章，最后给出 3 条新的续写方向。按系统提示的格式输出。`
+      `【本次选定的生成方向（必须作为续写主旨）】${direction}\n\n请从第 ${startNo} 章起，一次性续写 ${chapN} 章，最后给出 3 条新的续写方向。按系统提示的格式输出。\n（写作提醒：直接陈述，少用“不是……而是……”对比句，不写“怎么……怎么……”排比。）`
   }
 
   // ===== 前文概要：每章生成后补一份概要，续写时读「前情概要」而不是整章原文，避免忘事、剧情绕圈 =====
@@ -244,6 +255,94 @@
     }).join('\n')
   }
 
+  // ===== 套话句式检测与润色 =====
+  // 只检查叙述，不检查台词（“ ”「 」『 』里的内容），人说话偶尔这么讲是正常的
+  const CONTRAST_RES = [
+    /(?:并不是|并非|不是|不只是|不仅仅是|不单单是|不光是)[^。！？!?\n]{1,40}?(?:而是|[，,；;：:—…]+\s*(?:这?是(?!否)|更是|只是|倒是|反而是))/g,
+    /(?:并不是|并非|不是)[^。！？!?\n]{1,30}[。！？!?]+\s*(?:而是|只是|这是|是(?![的否]))/g,
+    /与其说[^。！？!?\n]{1,40}?[，,；;]\s*(?:倒)?不如说/g,
+    /(?:没有|不再是)[^。！？!?\n，,；;]{1,25}[，,；;]\s*(?:只有|只剩|有的只是)/g
+  ]
+  const WHY_RE = /怎么[^。！？!?\n]{1,18}?[，,；;、。]\s*(?:又|也|还|就)?怎么/g
+
+  function maskQuotes(s) { return String(s || '').replace(/“[^”]*”|「[^」]*」|『[^』]*』/g, m => '　'.repeat(m.length)) }
+
+  // 返回命中列表 [{ kind: 'contrast' | 'why', index }]
+  function findHits(masked) {
+    const out = []
+    CONTRAST_RES.forEach(re => {
+      re.lastIndex = 0
+      let m
+      while ((m = re.exec(masked))) {
+        if (m[0].length === 0) { re.lastIndex++; continue }
+        if (masked[m.index - 1] === '是') continue // “是不是”
+        out.push({ kind: 'contrast', index: m.index })
+      }
+    })
+    WHY_RE.lastIndex = 0
+    let w
+    while ((w = WHY_RE.exec(masked))) out.push({ kind: 'why', index: w.index })
+    return out
+  }
+
+  function quotesOf(t) { return (String(t || '').match(/“[^”]*”/g) || []).join('|') }
+
+  function parseNumbered(raw) {
+    const out = {}
+    const text = String(raw || '').replace(/```[a-zA-Z]*\n?/g, '')
+    const re = /===\s*(\d+)\s*===\s*\n?([\s\S]*?)(?=\n\s*===\s*\d+\s*===|$)/g
+    let m
+    while ((m = re.exec(text))) { const t = m[2].trim(); if (t) out[Number(m[1])] = t }
+    return out
+  }
+
+  // 找出需要处理的段落：怎么…怎么… 一律处理；对比转折每章保留第 1 处，其余处理
+  function flagParas(paras) {
+    const flagged = []
+    let seen = 0
+    paras.forEach((p, i) => {
+      const hs = findHits(maskQuotes(p))
+      const w = hs.filter(h => h.kind === 'why').length
+      const c = hs.length - w
+      let bad = w > 0
+      if (c) { seen += c; if (seen > 1) bad = true }
+      if (bad) flagged.push(i)
+    })
+    return flagged
+  }
+
+  // 只把命中的段落发给 AI 改写，其余原样不动。改写不合格（改了台词、长度悬殊、问题没少）就保留原文
+  async function polishBody(body) {
+    const paras = normalizeBody(body).split(/\n{2,}/)
+    const flagged = flagParas(paras).slice(0, 12)
+    if (!flagged.length || typeof window.callAI !== 'function') return { body: normalizeBody(body), fixed: 0 }
+    let fixed = 0
+    for (let b = 0; b < flagged.length; b += 6) {
+      const batch = flagged.slice(b, b + 6)
+      const text = batch.map((pi, k) => `===${k + 1}===\n${paras[pi]}`).join('\n\n')
+      let raw = ''
+      try {
+        raw = await window.callAI([{ role: 'user', content: text }], {
+          system: '你是小说文字编辑。下面是若干段小说正文，每段含有生硬的“对比转折”句（如“不是……而是……”“不是……，是……”“与其说……不如说……”“没有……只有……”）或“怎么……怎么……”排比句。请改写这些段落：\n①把有问题的句子改成直接陈述——只写真实的那一面，删掉被否定的那一半，必要时用一个具体的动作或细节代替；\n②不要用别的对比句或排比句来顶替；\n③除有问题的句子外，其余文字、人名、事实、对白（引号“ ”里的内容）一字不改，段落长度与原来相近；\n④保持原文的语气和人称。\n输出格式严格为：\n===编号===\n改写后的整段\n（每段一个编号，不要任何额外说明）',
+          temperature: 0.6
+        })
+      } catch (e) { console.warn('[ao3] 润色调用失败', e); continue }
+      const got = parseNumbered(raw)
+      batch.forEach((pi, k) => {
+        const neu = got[k + 1]
+        const old = paras[pi]
+        if (!neu) return
+        const ratio = neu.length / Math.max(1, old.length)
+        if (ratio < 0.5 || ratio > 1.6) return
+        if (quotesOf(neu) !== quotesOf(old)) return
+        if (findHits(maskQuotes(neu)).length >= findHits(maskQuotes(old)).length) return
+        paras[pi] = neu
+        fixed++
+      })
+    }
+    return { body: paras.join('\n\n'), fixed }
+  }
+
   // ===== 生成 =====
   async function generate(workId, mode, opts) {
     opts = opts || {}
@@ -291,6 +390,14 @@
         if (!/^第\s*\d+\s*章/.test(title)) title = '第 ' + no + ' 章 · ' + title
         return { title: title.replace(/^第\s*\d+\s*章/, '第 ' + no + ' 章'), body: c.body }
       })
+      let polished = 0
+      if (store.polish !== false) {
+        progressText[workId] = '正在润色套话句式…'
+        refreshReaderIfOpen(workId, isRewrite ? rwAt : undefined)
+        for (const c of chaps) {
+          try { const r = await polishBody(c.body); c.body = r.body; polished += r.fixed } catch (e) { console.warn('[ao3] 润色失败，保留原文', e) }
+        }
+      }
       if ((isContinue || isRewrite) && opts.direction && chaps[0]) chaps[0].dir = opts.direction
       if (chaps.length) chaps[chaps.length - 1].nextDirs = parsed.next || []
       if (isRewrite) {
@@ -312,7 +419,7 @@
       work.failReason = ''
       await persist()
       ensureSummaries(work).catch(() => {}) // 后台给新章节补概要，不让你等
-      window.toast?.(isRewrite ? `已重写第 ${rwAt + 1} 章` : isContinue ? `已续写 ${chaps.length} 章` : `已生成「${work.title}」`)
+      window.toast?.((isRewrite ? `已重写第 ${rwAt + 1} 章` : isContinue ? `已续写 ${chaps.length} 章` : `已生成「${work.title}」`) + (polished ? `（润色 ${polished} 处）` : ''))
     } catch (e) {
       if (isContinue || isRewrite) work.continuing = false
       else work.status = 'failed'
@@ -506,6 +613,7 @@
         </div>
         <div class="ao3-field"><label>主题（每类最多选一个）</label><div id="ao3-themes">${themeHTML}</div></div>
         <div class="ao3-field"><label>创作备注 <em>可选</em></label><textarea id="ao3-prompt" class="ao3-textarea" placeholder="想写什么情节、什么场景、什么感觉都可以说"></textarea></div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0 12px"><input type="checkbox" id="ao3-polish"${store.polish !== false ? ' checked' : ''}><span>自动润色套话句式 <em style="opacity:.6;font-style:normal">（改掉“不是…而是…”“怎么…怎么…”，超标时才多花一点 token）</em></span></label>
         <button type="button" class="ao3-submit" id="ao3-publish">发布作品</button>
       </div>`
     const q = id => main.querySelector(id)
@@ -529,6 +637,7 @@
       }).join('')
       main.querySelector('#ao3-prompt').value = keep
     })
+    q('#ao3-polish')?.addEventListener('change', e => { store.polish = !!e.target.checked; persist() })
     q('#ao3-publish').addEventListener('click', () => publish(main, page, users))
   }
 
