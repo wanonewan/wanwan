@@ -6600,6 +6600,75 @@ function _wcSeparateTrailingSpecialMessage(line) {
   return s
 }
  
+// ===== 语音消息格式兜底 =====
+// 模型常见的写坏方式：语音块夹在普通文字中间、冒号写成英文、括号全半角混用、结尾漏掉 ]。
+// 这里先把每个语音块修回标准的 [某某的语音：内容]，并让它独占一行，再交给后面的拆分逻辑。
+const _WC_VOICE_OPEN_RE = /[\[［【(（]\s*([^\s\[\]［］【】()（）:：，。！？、]{1,20}?)\s*的\s*语音\s*[:：︰﹕]\s*/g
+
+// 语音内容里，开头或句末标点后面的 (语气) / （语气） / [语气] 修回 【语气】
+function _wcFixVoiceTags(text) {
+  return String(text || '').replace(/(^|[。！？!?…~～，,、\s])[(（]\s*([^()（）\[\]【】\n]{1,10}?)\s*[)）]/g, '$1【$2】')
+}
+
+function _wcNormalizeVoiceLine(line) {
+  const src = String(line || '')
+  if (!/的\s*语音\s*[:：︰﹕]/.test(src)) return src
+  // 找出所有语音块的起点
+  const starts = []
+  _WC_VOICE_OPEN_RE.lastIndex = 0
+  let m
+  while ((m = _WC_VOICE_OPEN_RE.exec(src))) {
+    starts.push({ index: m.index, contentStart: m.index + m[0].length, name: m[1] })
+  }
+  if (!starts.length) return src
+  const out = []
+  let cursor = 0
+  for (let i = 0; i < starts.length; i++) {
+    const st = starts[i]
+    if (st.index < cursor) continue
+    const before = src.slice(cursor, st.index).trim()
+    if (before) out.push(before)
+    const limit = i + 1 < starts.length ? starts[i + 1].index : src.length
+    // 从内容起点往后找结尾的 ]：【】标签内部的括号不算，内容里成对的 [笑] 不算
+    let tagOpen = false
+    let depth = 0
+    let end = -1
+    // 外层括号如果写成了 【】 或 ()，对应的右括号也算结尾
+    const opener = src[st.index]
+    const altClose = opener === '【' ? '】' : opener === '(' ? ')' : opener === '（' ? '）' : ''
+    for (let k = st.contentStart; k < limit; k++) {
+      const ch = src[k]
+      if (altClose && ch === altClose && !tagOpen && depth === 0) { end = k; break }
+      if (ch === '【') tagOpen = true
+      else if (ch === '】') tagOpen = false
+      else if (tagOpen) continue
+      else if (ch === '[' || ch === '［') depth++
+      else if (ch === ']' || ch === '］') {
+        if (depth > 0) depth--
+        else { end = k; break }
+      }
+    }
+    let content
+    if (end === -1) {
+      // 没写结尾 ]：到下一个语音块之前，或到这一行结束
+      content = src.slice(st.contentStart, limit)
+      cursor = limit
+    } else {
+      content = src.slice(st.contentStart, end)
+      cursor = end + 1
+    }
+    content = _wcFixVoiceTags(content.trim())
+    if (content) out.push(`[${st.name}的语音：${content}]`)
+  }
+  const tail = src.slice(cursor).trim()
+  if (tail) out.push(tail)
+  return out.join('\n')
+}
+
+function _wcNormalizeVoiceFormat(reply) {
+  return String(reply || '').split(/\r?\n/).map(_wcNormalizeVoiceLine).join('\n')
+}
+
 function _wcSeparateSpecialMessages(reply) {
   return String(reply || '').split(/\r?\n/).map(_wcSeparateTrailingSpecialMessage).join('\n')
 }
@@ -6614,6 +6683,7 @@ function normalizeWechatAIFields(parsed) {
   let thought = typeof parsed.thought === 'string' ? parsed.thought : ''
   let status = typeof parsed.status === 'string' ? parsed.status : ''
   reply = reply.trim()
+  reply = _wcNormalizeVoiceFormat(reply)
   reply = _wcSeparateSpecialMessages(reply)
   thought = _cleanThoughtDecor(thought)
   status = status.trim().slice(0, 15)
