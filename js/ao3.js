@@ -166,7 +166,7 @@
       formatRule +
       `\n正文要求：中文；每章约 ${per} 字（可上下浮动 15%）；含对话与场景；符合评级与归档警告；角色言行贴合各自设定；章节之间情节连贯。\n` +
       `排版：自然分段，段落之间空一行；台词放在中文引号“ ”里；心理活动放在（ ）里；强调用 *星号*；场景转换可用〔 〕。` +
-      (mode === 'continue' ? `\n这是续写：紧接上一章的剧情，不要复述旧章；本次续写必须围绕用户选定的「生成方向」展开。` : '') +
+      (mode === 'continue' ? `\n这是续写：紧接上一章的剧情，不要复述旧章；本次续写必须围绕用户选定的「生成方向」展开。\n【防止绕圈】用户会给你「前情概要」，里面写过的场景、对话和桥段都不要再写一遍；每一章都必须出现新的事件、冲突、信息或关系变化，让剧情真正向前推进。` : '') +
       `\n你在这一次回复里写完全部章节，不要拆成多次。\n` +
       userCenteredRule(ctx.userName, ctx.charNames) +
       (ctx.lore ? `\n\n【世界观参考】\n${ctx.lore}` : '') +
@@ -183,13 +183,65 @@
       return head + `\n请自行拟定标题、关系、标签与摘要，并一次性写出全部 ${chapN} 章，最后给出 3 条续写方向。按系统提示的格式输出。`
     }
     const chaps = work.chapters || []
-    const titles = chaps.map((c, i) => `${i + 1}. ${c.title}`).join('\n')
     const last = chaps[chaps.length - 1]
     let tail = last ? normalizeBody(last.body) : ''
-    if (tail.length > 2800) tail = '…' + tail.slice(-2800)
+    if (tail.length > 700) tail = '…' + tail.slice(-700)
     return `作品标题：${work.title}\n摘要：${work.summary || ''}\n关系：${work.relationship || ''}\n` + head +
-      `\n【已有章节目录】\n${titles}\n\n【上一章全文】\n${tail}\n\n` +
+      `\n【前情概要（按章节顺序，以下剧情都已经发生过，不要重复）】\n${buildRecap(chaps)}\n\n【上一章的结尾（只用来衔接场景和语气，不要复述）】\n${tail}\n\n` +
       `【本次选定的生成方向（必须作为续写主旨）】${direction}\n\n请从第 ${startNo} 章起，一次性续写 ${chapN} 章，最后给出 3 条新的续写方向。按系统提示的格式输出。`
+  }
+
+  // ===== 前文概要：每章生成后补一份概要，续写时读「前情概要」而不是整章原文，避免忘事、剧情绕圈 =====
+  const sumJobs = {}
+
+  function parseSummaries(raw) {
+    const out = {}
+    const re = /===\s*(\d+)\s*===\s*([\s\S]*?)(?=\n\s*===\s*\d+\s*===|$)/g
+    let m
+    while ((m = re.exec(String(raw || '')))) {
+      const t = m[2].trim()
+      if (t) out[Number(m[1])] = t.slice(0, 400)
+    }
+    return out
+  }
+
+  // 给还没有概要的章节补算概要（只看前 upTo 章；不传则全部）。同一部作品的补算排队执行，不会撞车
+  function ensureSummaries(work, upTo) {
+    const run = async () => {
+      const chaps = work.chapters || []
+      const limit = typeof upTo === 'number' ? Math.min(upTo, chaps.length) : chaps.length
+      const missing = []
+      for (let i = 0; i < limit; i++) if (chaps[i] && !chaps[i].summary) missing.push(i)
+      if (!missing.length || typeof window.callAI !== 'function') return
+      for (let b = 0; b < missing.length; b += 4) {
+        const batch = missing.slice(b, b + 4)
+        const text = batch.map(i => `【第${i + 1}章｜${chaps[i].title}】\n${normalizeBody(chaps[i].body)}`).join('\n\n')
+        let raw = ''
+        try {
+          raw = await window.callAI([{ role: 'user', content: `作品：${work.title}\n\n${text}\n\n请为上面每一章各写一份概要。` }], {
+            system: '你是小说编辑，负责为每一章写「前情概要」，供作者以后续写时回顾。要求：中文；每章 100～180 字；只写客观发生了什么（按时间顺序的关键事件、重要的对话与决定、人物关系或心态的变化、留下的悬念与伏笔），不写评价和感想；保留人名。输出格式严格为：\n===章节号===\n概要文字\n（章节号用阿拉伯数字，每章一段，不要任何额外说明）',
+            temperature: 0.3
+          })
+        } catch (e) { console.warn('[ao3] 概要生成失败', e); continue }
+        const got = parseSummaries(raw)
+        batch.forEach(i => { if (got[i + 1]) chaps[i].summary = got[i + 1] })
+        await persist()
+      }
+    }
+    const prev = sumJobs[work.id] || Promise.resolve()
+    const p = prev.then(run, run)
+    sumJobs[work.id] = p.catch(() => {})
+    return p
+  }
+
+  // 续写时给模型看的「前情概要」：每章一段；缺概要的章节退回成开头一小段；章节很多时早期章节压短
+  function buildRecap(chaps) {
+    const n = chaps.length
+    return chaps.map((c, i) => {
+      let t = c.summary || (normalizeBody(c.body).replace(/\s+/g, ' ').slice(0, 160) + '…')
+      if (n > 12 && i < n - 12) t = t.slice(0, 110)
+      return `第${i + 1}章《${String(c.title || '').replace(/^第\s*\d+\s*章\s*[·・]?\s*/, '')}》：${t}`
+    }).join('\n')
   }
 
   // ===== 生成 =====
@@ -216,6 +268,13 @@
     refreshReaderIfOpen(workId)
     refreshList()
     try {
+      if (isContinue) {
+        progressText[workId] = '正在整理前文概要…'
+        refreshReaderIfOpen(workId, isRewrite ? rwAt : undefined)
+        try { await ensureSummaries(work, isRewrite ? rwAt : undefined) } catch (e) { console.warn('[ao3] 补算概要失败，改用原文开头', e) }
+        progressText[workId] = isRewrite ? `正在重写第 ${rwAt + 1} 章…` : '正在等待接口返回，较长的文章可能需要几分钟…'
+        refreshReaderIfOpen(workId, isRewrite ? rwAt : undefined)
+      }
       const ctx = await buildContext(work)
       const raw = await window.callAI([{ role: 'user', content: userPrompt(apiMode, ctx, promptWork, chapN, per, startNo, opts.direction) }], {
         system: systemPrompt(apiMode, ctx, promptWork, chapN, per, startNo),
@@ -252,6 +311,7 @@
       work.words = workWords(work)
       work.failReason = ''
       await persist()
+      ensureSummaries(work).catch(() => {}) // 后台给新章节补概要，不让你等
       window.toast?.(isRewrite ? `已重写第 ${rwAt + 1} 章` : isContinue ? `已续写 ${chaps.length} 章` : `已生成「${work.title}」`)
     } catch (e) {
       if (isContinue || isRewrite) work.continuing = false
@@ -577,6 +637,7 @@
     page.querySelector('#ao3-read-main').innerHTML =
       `<div class="ao3-preface"><h2 class="title">${esc(w.title)}</h2><div class="byline">by ${esc(w.author)}</div>${symHTML(w)}<dl class="ao3-meta-dl">${metaRows}</dl>${w.summary ? `<blockquote class="ao3-summary"><b>Summary:</b> ${esc(w.summary)}</blockquote>` : ''}</div>` + body
     const canAct = st === 'ready' && !w.continuing
+    const hasNext = st === 'ready' && readState.ci < (w.chapters || []).length - 1
     const liked = store.kudos.includes(w.id)
     const marked = store.bookmarks.includes(w.id)
     page.querySelector('#ao3-read-actions').innerHTML =
@@ -584,7 +645,7 @@
       `<button type="button" data-act="bm" class="${marked ? 'on' : ''}"${canAct ? '' : ' disabled'}>${marked ? '已加书签' : '加书签'}</button>` +
       `<button type="button" data-act="cont"${canAct ? '' : ' disabled'}>${w.continuing ? '续写中…' : '继续'}</button>` +
       `<button type="button" data-act="chap"${canAct ? '' : ' disabled'}>本章管理</button>` +
-      `<button type="button" data-act="del" class="danger"${w.continuing ? ' disabled' : ''}>删除全文</button>`
+      `<button type="button" data-act="next"${hasNext ? '' : ' disabled'}>${hasNext ? '下一章' : '已是末章'}</button>`
     const main = page.querySelector('#ao3-read-main')
     main.querySelector('.ao3-chap-nav')?.addEventListener('click', e => {
       const b = e.target.closest('[data-ci]')
@@ -612,14 +673,13 @@
         openContinuePad(w)
       } else if (act === 'chap') {
         openChapterPad(w)
-      } else if (act === 'del') {
-        if (!window.confirm('删除整篇「' + w.title + '」？删除后无法恢复。\n（只想删掉某一章，请用「本章管理」）')) return
-        store.works = store.works.filter(x => x.id !== w.id)
-        store.bookmarks = store.bookmarks.filter(x => x !== w.id)
-        store.kudos = store.kudos.filter(x => x !== w.id)
-        await persist()
-        ttsStop(true)
-        window.closePage('ao3-read-page')
+      } else if (act === 'next') {
+        if (readState.ci >= (w.chapters || []).length - 1) return
+        ttsStop(false)
+        readState.ci++
+        renderReader()
+        const m = document.getElementById('ao3-read-main')
+        if (m) m.scrollTop = 0
         refreshList()
       }
     }
@@ -1124,7 +1184,7 @@
         <button type="button" class="ao3-submit" id="ao3-rw-go" style="margin-top:8px">重写${esc(titleShort)}${later ? `（并删除后面 ${later} 章）` : ''}</button>
         <div class="ao3-pad-sep"></div>
         <button type="button" class="ao3-pad-danger" id="ao3-chap-del"${ci === 0 ? ' disabled' : ''}>删除${esc(titleShort)}${later ? `及之后共 ${later + 1} 章` : ''}</button>
-        <p class="ao3-continue-tip" style="margin-top:6px">${ci === 0 ? '第一章不能单独删除；想删掉整篇，请用底栏的「删除全文」。' : `删除后回到第 ${ci} 章，可以重新点「继续」往下写。`}</p>
+        <p class="ao3-continue-tip" style="margin-top:6px">${ci === 0 ? '第一章不能单独删除；想删掉整篇，请回到作品列表，点那篇作品右侧的「删除」。' : `删除后回到第 ${ci} 章，可以重新点「继续」往下写。`}</p>
         <div class="ao3-continue-btns"><button type="button" class="ao3-btn-ghost" id="ao3-chap-cancel" style="flex:1">取消</button></div>
       </div>`
     page.appendChild(bd)
