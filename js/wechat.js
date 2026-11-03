@@ -5772,6 +5772,14 @@ function bindMsgLongPress(container, charId) {
   const chatPage = container.closest('.chat-window-page')
   const chatId = chatPage?.dataset?.chatId ? parseInt(chatPage.dataset.chatId, 10) : null
   bindMessageActionTargets(container, () => ({ scope: 'chat', charId, chatId }))
+    container.querySelectorAll('.call-record-bubble').forEach(bubble => {
+    if (bubble.dataset.callBound === '1') return
+    bubble.dataset.callBound = '1'
+    bubble.addEventListener('click', () => {
+      const msgId = Number(bubble.closest('.msg-row')?.dataset?.id)
+      if (msgId) window.openCallRecordFromMessage?.(msgId)
+    })
+  })
   container.querySelectorAll('.link-card-taobao[data-taobao-url]').forEach(card => {
     if (card.dataset.taobaoBound === '1') return
     card.dataset.taobaoBound = '1'
@@ -20740,6 +20748,8 @@ const CALL_DRAFT_KEY = 'callDraft'
 const CALL_IDLE_LIMIT_MS = 2 * 60 * 60 * 1000 // 超过这个时间没人说话，自动挂断（改这里的数字即可）
 let _callLastActivity = 0
 let _callIdleTimer = null
+let _callResumeRecordId = null // 正在续接的通话记录 id（有值说明这是一次"回到通话"）
+let _callResumeNote = ''       // 续接后第一次请求 AI 时附带的一句提示，回复成功后清空
 
 async function saveCallDraft() {
   if (_callState === 'idle' || !_callChatId || !_callStartTime) return
@@ -20751,6 +20761,7 @@ async function saveCallDraft() {
         charId: _callCharId,
         ownerUid: window._wechatUid,
         type: _callType || 'voice',
+        resumeRecordId: _callResumeRecordId || undefined,
         initiator: _callInitiator,
         startTime: _callStartTime,
         lastActivity: _callLastActivity || Date.now(),
@@ -20799,6 +20810,18 @@ async function recoverCallDraft() {
   const endAt = draft.lastActivity || draft.startTime
   const duration = Math.max(0, Math.floor((endAt - draft.startTime) / 1000))
   try {
+        if (draft.resumeRecordId) {
+      const merged = duration > 0 && msgs.length && await mergeResumedCall(draft.resumeRecordId, {
+        chatId: draft.chatId, charId: draft.charId, type: draft.type || 'voice',
+        initiator: draft.initiator || 'user', duration, messages: msgs, msgTime: endAt
+      })
+      if (merged) {
+        window.toast?.('上次没挂断的通话已自动保存')
+        if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
+        await clearCallDraft()
+        return
+      }
+    }
     const dup = await db.callRecords.where('chatId').equals(draft.chatId)
       .filter(r => r.createdAt === draft.startTime).count()
     if (!dup && duration > 0 && msgs.length) {
@@ -21451,7 +21474,15 @@ async function sendCallAIRequest(page) {
     }
 
     let messages = _callHistory.map(m => ({ role: m.role, content: m.content }))
-
+    // 回到通话后的第一次请求：附带一句"刚才中断了"的提示（不写进通话记录）
+    if (_callResumeNote) {
+      const last = messages[messages.length - 1]
+      if (last && last.role === 'user') {
+        messages[messages.length - 1] = { role: 'user', content: String(last.content || '') + '\n' + _callResumeNote }
+      } else {
+        messages.push({ role: 'user', content: _callResumeNote })
+      }
+    }
     if (_realCameraActive && _callType === 'video') {
       const frame = await captureVideoFrame()
       if (frame) {
@@ -21486,7 +21517,7 @@ async function sendCallAIRequest(page) {
       speech: parsed.speech,
       timestamp: Date.now()
     })
-
+    _callResumeNote = ''
     if (_callState === 'connecting') {
       _callState = 'connected'
       _callStartTime = Date.now()
@@ -21984,7 +22015,161 @@ function dispatchCallStateChange() {
     detail: { state: _callState, charId: _callCharId, chatId: _callChatId, minimized: _callMinimized }
   }))
 }
+// 续接的通话：把新内容合并回原记录和聊天里原来那条通话消息
+async function mergeResumedCall(recordId, info) {
+  try {
+    const old = await db.callRecords.get(recordId)
+    if (!old) return false
+    await db.callRecords.update(recordId, { duration: info.duration, messages: info.messages })
+    const mm = String(Math.floor(info.duration / 60)).padStart(2, '0')
+    const ss = String(info.duration % 60).padStart(2, '0')
+    const typeLabel = info.type === 'video' ? '视频通话' : '语音通话'
+    const content = `[${typeLabel} ${mm}:${ss}]`
+    const linked = await db.messages.where('chatId').equals(info.chatId)
+      .filter(m => Number(m.callRecordId) === Number(recordId)).first()
+    if (linked) {
+      await db.messages.update(linked.id, { content, createdAt: info.msgTime })
+    } else {
+      await addPrivateMessageIdempotently({
+        chatId: info.chatId,
+        charId: info.charId,
+        role: info.initiator === 'char' ? 'assistant' : 'user',
+        content,
+        callRecordId: recordId,
+        createdAt: info.msgTime
+      })
+    }
+    return true
+  } catch (e) {
+    console.error('合并通话记录失败', e)
+    return false
+  }
+}
 
+// 点聊天里的通话气泡 → 打开这次通话的详情页（里面有「回到通话」按钮）
+async function openCallRecordFromMessage(msgId) {
+  const msg = await db.messages.get(msgId)
+  if (!msg) return
+  let record = null
+  const linkedId = Number(msg.callRecordId)
+  if (Number.isInteger(linkedId) && linkedId > 0) record = await db.callRecords.get(linkedId)
+  if (!record) {
+    // 老消息没有关联 id：按类型+时长+时间就近匹配
+    const m = String(msg.content || '').match(/^\[(视频通话|语音通话)\s+(\d{2}):(\d{2})\]$/)
+    if (m) {
+      const type = m[1] === '视频通话' ? 'video' : 'voice'
+      const dur = Number(m[2]) * 60 + Number(m[3])
+      const rows = await db.callRecords.where('chatId').equals(msg.chatId).toArray()
+      let bestDist = Infinity
+      for (const r of rows) {
+        if ((r.type === 'video' ? 'video' : 'voice') !== type || Number(r.duration) !== dur) continue
+        const d = Math.abs((Number(msg.createdAt) || 0) - ((Number(r.createdAt) || 0) + dur * 1000))
+        if (d < bestDist) { record = r; bestDist = d }
+      }
+    }
+  }
+  if (!record) { window.toast?.('没有找到这次通话的内容'); return }
+  const display = await getCallDisplayFor(record.ownerUid || window._wechatUid, record.charId)
+  openCallRecordDetail(record.id, display?.name || '', record.ownerUid)
+}
+window.openCallRecordFromMessage = openCallRecordFromMessage
+
+// 回到通话：还原之前的对话和计时，接着原来的进度聊
+async function resumeCall(recordId) {
+  if (_callState !== 'idle') { window.toast?.('正在通话中'); return }
+  let record = null
+  try { record = await db.callRecords.get(recordId) } catch (_) {}
+  if (!record || !Array.isArray(record.messages) || !record.messages.length) {
+    window.toast?.('这条通话没有可续接的内容')
+    return
+  }
+  unlockCallAudioPlayback()
+
+  const chatId = record.chatId
+  const charId = record.charId
+  const type = record.type === 'video' ? 'video' : 'voice'
+  _callChatId = chatId
+  _callCharId = charId
+  _callType = type
+  _callState = 'connecting'
+  _callStartTime = null
+  _callInitiator = record.initiator || 'user'
+  _realCameraActive = false
+  _realCameraStream = null
+  _callResumeRecordId = record.id
+  _callHistory = record.messages.map(m => ({
+    role: m.role,
+    content: m.content,
+    scene: m.scene || undefined,
+    speech: m.speech || undefined,
+    timestamp: m.timestamp || Date.now()
+  }))
+
+  const helpers = h()
+  const char = await helpers.getWechatDisplayCharacter?.(charId)
+  if (!char) {
+    window.toast?.('角色不存在')
+    resetCallState()
+    return
+  }
+  try {
+    const autoCfg = await db.config.get('callAutoSpeak')
+    _callAutoSpeak = autoCfg ? autoCfg.value !== false : true
+  } catch (_) { _callAutoSpeak = true }
+
+  const page = document.createElement('div')
+  page.id = 'call-page'
+  page.className = `full-page call-page ${type === 'video' ? 'video-call-page' : 'voice-call-page'}`
+  page.dataset.chatId = chatId
+  page.dataset.charId = charId
+  page.innerHTML = type === 'video' ? buildVideoCallPageHTML(char) : buildVoiceCallPageHTML(char)
+  window.openPage(page)
+  bindCallEvents(page, type)
+
+  // 把之前的对话气泡重新画出来（第一条是"发起了通话"的开场白，不显示）
+  _callHistory.forEach((m, i) => {
+    if (m.role === 'user') {
+      if (i === 0) return
+      appendCallUserBubble(page, m.content || '')
+    } else if (m.role === 'assistant') {
+      let scene = m.scene || ''
+      let speech = m.speech || ''
+      if (!scene && !speech && m.content) {
+        try {
+          const p = JSON.parse(m.content)
+          scene = p.scene || ''
+          speech = p.speech || ''
+        } catch (_) { speech = m.content }
+      }
+      if (scene) updateCallScene(page, scene)
+      if (speech) updateCallSpeech(page, speech)
+    }
+  })
+
+  try {
+    _callSystemPrompt = type === 'video'
+      ? await buildVideoCallSystemPrompt(chatId, charId)
+      : await buildVoiceCallSystemPrompt(chatId, charId)
+    const userName = window._wechatUser?.name || '用户'
+    _callResumeNote = `（系统提示：刚才的${type === 'video' ? '视频通话' : '通话'}意外中断了，现在${userName}重新接通了。请像真人一样自然地接上刚才的话题，不要重新开场，不要重复说过的话。）`
+
+    // 计时接着原来的时长走
+    _callState = 'connected'
+    _callStartTime = Date.now() - Math.max(0, Number(record.duration) || 0) * 1000
+    _callLastActivity = Date.now()
+    startCallTimer(page)
+    startCallIdleWatch()
+    updateCallStatus(page, formatCallDuration())
+    dispatchCallStateChange()
+    saveCallDraft()
+    await sendCallAIRequest(page)
+  } catch (e) {
+    console.error('回到通话失败', e)
+    updateCallStatus(page, '连接失败')
+    window.toast?.('回到通话失败：' + (e.message || '未知错误'))
+  }
+}
+window.resumeCall = resumeCall
 // ===== 结束通话 =====
 
 async function endCall(opts = {}) {
@@ -21992,6 +22177,7 @@ async function endCall(opts = {}) {
   const charId = _callCharId
   const type = _callType
   const initiator = _callInitiator
+  const resumeId = _callResumeRecordId
   // opts.endAt：闲置自动挂断时，时长只算到最后一次说话
   const endAt = (opts && typeof opts.endAt === 'number' && _callStartTime) ? opts.endAt : null
   const duration = endAt ? Math.max(0, Math.floor((endAt - _callStartTime) / 1000)) : getCallDurationSeconds()
@@ -22022,41 +22208,59 @@ async function endCall(opts = {}) {
   window.closePage('call-page')
 
   if (chatId && duration > 0) {
-    let callRecordId = null
-    try {
-      callRecordId = await db.callRecords.add({
-        chatId,
-        charId,
-        ownerUid: window._wechatUid,
-        type: type || 'voice',
-        initiator,
-        duration,
-        messages: history.map(m => ({
-          role: m.role,
-          content: m.content,
-          scene: m.scene || undefined,
-          speech: m.speech || undefined,
-          timestamp: m.timestamp || Date.now()
-        })),
-        createdAt: startTime
+    const savedMessages = history.map(m => ({
+      role: m.role,
+      content: m.content,
+      scene: m.scene || undefined,
+      speech: m.speech || undefined,
+      timestamp: m.timestamp || Date.now()
+    }))
+
+    // 续接的通话：合并回原记录，不新增
+    let merged = false
+    if (resumeId) {
+      merged = await mergeResumedCall(resumeId, {
+        chatId, charId, type, initiator, duration, messages: savedMessages, msgTime: Date.now()
       })
-    } catch (e) {
-      console.error('保存通话记录失败', e)
+      if (merged) {
+        try {
+          const cw = document.querySelector(`.chat-window-page[data-chat-id="${chatId}"]`)
+          if (cw && typeof refreshChat === 'function') refreshChat(cw, { scrollToBottom: false })
+        } catch (_) {}
+      }
     }
 
-    try {
-      const typeLabel = type === 'video' ? '视频通话' : '语音通话'
-      const msgRole = initiator === 'char' ? 'assistant' : 'user'
-      await addPrivateMessageIdempotently({
-        chatId,
-        charId,
-        role: msgRole,
-        content: `[${typeLabel} ${durationStr}]`,
-        ...(callRecordId ? { callRecordId } : {}),
-        createdAt: Date.now()
-      })
-    } catch (e) {
-      console.error('保存通话消息失败', e)
+    if (!merged) {
+      let callRecordId = null
+      try {
+        callRecordId = await db.callRecords.add({
+          chatId,
+          charId,
+          ownerUid: window._wechatUid,
+          type: type || 'voice',
+          initiator,
+          duration,
+          messages: savedMessages,
+          createdAt: startTime
+        })
+      } catch (e) {
+        console.error('保存通话记录失败', e)
+      }
+
+      try {
+        const typeLabel = type === 'video' ? '视频通话' : '语音通话'
+        const msgRole = initiator === 'char' ? 'assistant' : 'user'
+        await addPrivateMessageIdempotently({
+          chatId,
+          charId,
+          role: msgRole,
+          content: `[${typeLabel} ${durationStr}]`,
+          ...(callRecordId ? { callRecordId } : {}),
+          createdAt: Date.now()
+        })
+      } catch (e) {
+        console.error('保存通话消息失败', e)
+      }
     }
   }
   await clearCallDraft()
@@ -22065,6 +22269,8 @@ async function endCall(opts = {}) {
 function resetCallState() {
   stopCallIdleWatch()
   _callLastActivity = 0
+  _callResumeRecordId = null
+  _callResumeNote = ''
   cancelCallTTSRetry()
   _callTTSCanceledRetrySeqs = new Set()
   _callHistory = []
@@ -22217,6 +22423,7 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
       <div class="call-detail-time">${callEscHtml(time)}</div>
       <div class="call-detail-duration">${callEscHtml(typeLabel)} · ${mm}:${ss}</div>
     </div>
+       ${(record.messages || []).length ? `<div style="padding:12px 16px 0;"><button type="button" id="btn-call-resume" style="width:100%;padding:12px 0;border:none;border-radius:10px;background:var(--accent-color,#07c160);color:#fff;font-size:16px;"><i class="fa-solid ${record.type === 'video' ? 'fa-video' : 'fa-phone'}"></i> 回到通话</button></div>` : ''}
     <div class="call-detail-messages">${messagesHTML}</div>
   `
 
@@ -22224,6 +22431,13 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
   page.querySelector('#btn-call-detail-back').addEventListener('click', () => {
     stopSpeakOnce()
     window.closePage('call-record-detail-page')
+  })
+    page.querySelector('#btn-call-resume')?.addEventListener('click', () => {
+    if (_callState !== 'idle') { window.toast?.('正在通话中'); return }
+    stopSpeakOnce()
+    window.closePage('call-record-detail-page')
+    if (document.getElementById('call-records-page')) window.closePage('call-records-page')
+    setTimeout(() => resumeCall(record.id), 350)
   })
   page.querySelectorAll('.call-detail-speak').forEach(btn => {
     btn.addEventListener('click', () => {
