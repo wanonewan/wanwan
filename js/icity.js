@@ -516,7 +516,19 @@
     const chat = await db.chats.where('[ownerUid+charId]').equals([base.ownerUid, base.friendId]).first()
     if (chat) {
       const msgs = await db.messages.where('chatId').equals(chat.id).toArray()
-      msgs.forEach(m => items.push({ ts: icityTs(m.createdAt), source: 'online', role: m.role, content: m.content }))
+            let callMap = new Map()
+      try { if (window.getCallLinesForMessages) callMap = await window.getCallLinesForMessages(chat.id, msgs) } catch (_) {}
+      msgs.forEach(m => {
+        const ts = icityTs(m.createdAt)
+        const call = callMap.get(m.id)
+        if (call) {
+          items.push({ ts, source: 'call', role: 'system', speaker: '系统', content: `【${call.type}开始，${call.initiator === 'char' ? '角色发起' : '用户发起'}，时长${call.duration}】` })
+          call.lines.forEach(l => items.push({ ts, source: 'call', role: l.role, content: l.text }))
+          items.push({ ts, source: 'call', role: 'system', speaker: '系统', content: `【${call.type}结束】` })
+          return
+        }
+        items.push({ ts, source: 'online', role: m.role, content: m.content })
+      })
       const offline = await db.offlineChats.where('charId').equals(base.friendId).toArray()
       offline
         .filter(m => Number(m.ownerUid) === Number(base.ownerUid) && Number(m.chatId) === Number(chat.id) && m.mode !== 'script')
@@ -531,7 +543,7 @@
         return {
           ts: m.ts,
           source: m.source,
-          speaker: m.role === 'user' ? base.userName : base.friendName,
+          speaker: m.speaker || (m.role === 'user' ? base.userName : base.friendName),
           text: text.trim()
         }
       })
