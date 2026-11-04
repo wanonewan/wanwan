@@ -157,8 +157,10 @@
   function styleRule() {
     return '\n\n【文风要求（必须遵守，写作时随时对照）】\n' +
       '1. 想说什么就直接说。不要先否定一个没人提过的说法，再补一句纠正。像“他不是生气，而是害怕”“这不是A，是B”“与其说A，不如说B”“没有A，只有B”这类对比转折句，整篇最多出现 2 处，且只能出现在真正需要对比的地方。\n' +
+      '   如果某处确实需要“否定再转折”，就写得有分量：被否定的必须是读者真会误会的东西，转折之后要展开动作、感官和感受，不要写成“不是A，就是B”“不是A，是B”这种短短两截就结束的句子。\n' +
       '   坏：他不是生气，而是害怕。 → 好：他的手指在杯沿上收紧，半天没松开。\n' +
       '   坏：这不是安慰，是承诺。 → 好：她说：“以后我都在。”\n' +
+      '   坏：不是亲，就是贴着。 → 可以这样写（真需要时）：不是暧昧的亲吮，只是贴着，平静而有重量。鼻尖吸气，索取一种很久以来缺少的安心。\n' +
       '2. 不要写“怎么……怎么……”的排比句，也不要连续两句以上用同一种句式开头或收尾。句子长短、句式要有变化，像真人写的。\n' +
       '3. 情绪用动作、细节、对白来呈现，不要替读者总结感悟，不要段末升华。'
   }
@@ -258,8 +260,8 @@
   // ===== 套话句式检测与润色 =====
   // 只检查叙述，不检查台词（“ ”「 」『 』里的内容），人说话偶尔这么讲是正常的
   const CONTRAST_RES = [
-    /(?:并不是|并非|不是|不只是|不仅仅是|不单单是|不光是)[^。！？!?\n]{1,40}?(?:而是|[，,；;：:—…]+\s*(?:这?是(?!否)|更是|只是|倒是|反而是))/g,
-    /(?:并不是|并非|不是)[^。！？!?\n]{1,30}[。！？!?]+\s*(?:而是|只是|这是|是(?![的否]))/g,
+    /(?:并不是|并非|不是|不只是|不仅仅是|不单单是|不光是)[^。！？!?\n]{1,40}?(?:而是|[，,；;：:—…]+\s*(?:这?是(?!否)|更是|只是|就是|才是|不过是|只不过是|仅仅是|倒是|反而是))/g,
+    /(?:并不是|并非|不是)[^。！？!?\n]{1,30}[。！？!?]+\s*(?:而是|只是|就是|才是|这是|是(?![的否]))/g,
     /与其说[^。！？!?\n]{1,40}?[，,；;]\s*(?:倒)?不如说/g,
     /(?:没有|不再是)[^。！？!?\n，,；;]{1,25}[，,；;]\s*(?:只有|只剩|有的只是)/g
   ]
@@ -323,7 +325,7 @@
       let raw = ''
       try {
         raw = await window.callAI([{ role: 'user', content: text }], {
-          system: '你是小说文字编辑。下面是若干段小说正文，每段含有生硬的“对比转折”句（如“不是……而是……”“不是……，是……”“与其说……不如说……”“没有……只有……”）或“怎么……怎么……”排比句。请改写这些段落：\n①把有问题的句子改成直接陈述——只写真实的那一面，删掉被否定的那一半，必要时用一个具体的动作或细节代替；\n②不要用别的对比句或排比句来顶替；\n③除有问题的句子外，其余文字、人名、事实、对白（引号“ ”里的内容）一字不改，段落长度与原来相近；\n④保持原文的语气和人称。\n输出格式严格为：\n===编号===\n改写后的整段\n（每段一个编号，不要任何额外说明）',
+          system: '你是小说文字编辑。下面是若干段小说正文，每段含有生硬的“对比转折”句（如“不是……而是……”“不是……，是……”“与其说……不如说……”“没有……只有……”）或“怎么……怎么……”排比句。请改写这些段落：\n①把有问题的句子改成直接陈述——只写真实的那一面，删掉被否定的那一半，必要时用一个具体的动作或细节代替（例：“不是亲，就是贴着”可改成“他的唇贴在她颈窝里，没有动，鼻尖轻轻吸了口气”）；\n②不要用别的对比句或排比句来顶替；\n③除有问题的句子外，其余文字、人名、事实、对白（引号“ ”里的内容）一字不改，段落长度与原来相近；\n④保持原文的语气和人称。\n输出格式严格为：\n===编号===\n改写后的整段\n（每段一个编号，不要任何额外说明）',
           temperature: 0.6
         })
       } catch (e) { console.warn('[ao3] 润色调用失败', e); continue }
@@ -1270,6 +1272,36 @@
     window.toast?.(`已删除 ${removed} 章`)
   }
 
+  // ===== 全文自检：把所有章节里的套话句式找出来并润色 =====
+  async function polishWholeWork(w, bd) {
+    if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
+    if (typeof window.callAI !== 'function') { window.toast?.('请先在设置里配置 API'); return }
+    const chaps = w.chapters || []
+    const plan = chaps.map(c => flagParas(normalizeBody(c.body).split(/\n{2,}/)).length)
+    const paraTotal = plan.reduce((a, b) => a + Math.min(b, 12), 0)
+    if (!paraTotal) { window.toast?.('检查完毕，没有发现需要修改的套话句式'); return }
+    const calls = plan.reduce((a, b) => a + Math.ceil(Math.min(b, 12) / 6), 0)
+    if (!window.confirm(`发现 ${plan.filter(n => n > 0).length} 章里共 ${paraTotal} 段含有套话句式，将调用 ${calls} 次 AI 修改（只改这些段落，其余原文不动）。确定吗？`)) return
+    if (bd) bd.remove()
+    busy = true
+    ttsStop(true)
+    let fixed = 0
+    try {
+      for (let i = 0; i < chaps.length; i++) {
+        if (!plan[i]) continue
+        window.toast?.(`正在润色第 ${i + 1}/${chaps.length} 章…`)
+        try { const r = await polishBody(chaps[i].body); if (r.fixed) { chaps[i].body = r.body; fixed += r.fixed; await persist() } } catch (e) { console.warn('[ao3] 全文润色失败', e) }
+      }
+      w.words = workWords(w)
+      await persist()
+    } finally {
+      busy = false
+      renderReader()
+      refreshList()
+    }
+    window.toast?.(fixed ? `已润色 ${fixed} 段` + (plan.some(n => n > 12) ? '，部分章节还有剩余，可以再点一次' : '') : '没能改成功（接口失败或改写不合格），原文已保留，可以再试一次')
+  }
+
   function openChapterPad(w) {
     if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
     const page = document.getElementById('ao3-read-page')
@@ -1292,6 +1324,10 @@
         <textarea id="ao3-rw-dir" class="ao3-textarea" placeholder="想怎么改？可以留空，会承接上一章重新写一个不同的版本">${esc(dir)}</textarea>
         <button type="button" class="ao3-submit" id="ao3-rw-go" style="margin-top:8px">重写${esc(titleShort)}${later ? `（并删除后面 ${later} 章）` : ''}</button>
         <div class="ao3-pad-sep"></div>
+        <label class="ao3-continue-label">自检全文套话句式</label>
+        <p class="ao3-continue-tip">检查本篇所有章节里“不是…而是…”“怎么…怎么…”这类句式，只改写命中的段落。</p>
+        <button type="button" class="ao3-btn-ghost" id="ao3-polish-go" style="width:100%">自检并润色全文</button>
+        <div class="ao3-pad-sep"></div>
         <button type="button" class="ao3-pad-danger" id="ao3-chap-del"${ci === 0 ? ' disabled' : ''}>删除${esc(titleShort)}${later ? `及之后共 ${later + 1} 章` : ''}</button>
         <p class="ao3-continue-tip" style="margin-top:6px">${ci === 0 ? '第一章不能单独删除；想删掉整篇，请回到作品列表，点那篇作品右侧的「删除」。' : `删除后回到第 ${ci} 章，可以重新点「继续」往下写。`}</p>
         <div class="ao3-continue-btns"><button type="button" class="ao3-btn-ghost" id="ao3-chap-cancel" style="flex:1">取消</button></div>
@@ -1306,6 +1342,7 @@
       ttsStop(true)
       generate(w.id, 'rewrite', { rewriteAt: ci, direction })
     })
+    bd.querySelector('#ao3-polish-go').addEventListener('click', () => polishWholeWork(w, bd))
     bd.querySelector('#ao3-chap-del').addEventListener('click', () => {
       if (ci === 0) return
       if (!window.confirm(`删除${titleShort}${later ? `及之后共 ${later + 1} 章` : ''}？删除后无法恢复。`)) return
