@@ -752,7 +752,7 @@ ${lines}`
       return { ok: false, skipped: true, reason: '自动总结未开启', memoryCount: 0, messageCount: 0 }
     }
     var msgs = await db.messages.where('chatId').equals(chatId).sortBy('createdAt')
-    var fresh = msgs.filter(function(m) { return m.id > settings.lastSummarizedMessageId })
+    var fresh = msgs.filter(function(m) { return m.id > settings.lastSummarizedMessageId && !m.callRecordId })
     if (!fresh.length) {
       return { ok: false, skipped: true, reason: '没有可总结的新消息', memoryCount: 0, messageCount: 0 }
     }
@@ -882,7 +882,111 @@ ${lines}`
     await db.config.put({ key: 'memoryLastSummaryAt', value: Date.now() })
     return { ok: true, skipped: false, memoryCount: rows.length, messageCount: source.length, embeddingFailed: embeddingFailed }
   }
+  function buildCallSummaryPrompt(lines) {
+    var text = lines.map(function(l) {
+      return (l.role === 'assistant' ? '角色' : '用户') + '：' + String(l.text || '').replace(/\s+/g, ' ').slice(0, 800)
+    }).join('\n')
+    return `你是一个通话记忆整理器。请根据下面的电话通话记录，提取适合长期保存的记忆。
 
+要求：
+1. 使用第三人称叙述，注明这是电话里说的。
+2. 客观平实：只记录通话中谈到的重要事情、表达的偏好、形成的约定或关系变化；日常寒暄不用记。
+3. 禁止使用强烈情绪词汇，不要价值升华，不要写感悟。
+4. 禁止加入通话记录中没有出现的信息。
+5. 通话内容较多时可拆成多条，每条只讲一件事；标题尽量简短；内容150字以内。
+
+请返回合法 JSON，不要输出 Markdown，不要输出 JSON 以外的文字。
+
+JSON 格式：
+{
+  "memories": [
+    {
+      "title": "简短标题",
+      "content": "第三人称、客观平实的记忆内容，150字以内",
+      "keywords": ["关键词1", "关键词2"],
+      "valence": 0,
+      "arousal": 0.3,
+      "importance": 5
+    }
+  ]
+}
+
+字段说明：
+- valence：情感效价，-1 到 1。
+- arousal：唤醒度，0 到 1。
+- importance：重要度，1 到 10。长期关系事实、约定、重要事情更高；临时闲聊更低。
+
+通话记录：
+${text}`
+  }
+
+  // 给一通电话单独生成记忆；同一通电话内容没变就不重复生成，内容变了（续接通话）就重做
+  async function summarizeCall(chatId, charId, ownerUid, recordId, options) {
+    options = options || {}
+    if (!window.callMemoryAI || !db.memories || !db.memoryRuns || !window.getCallRecordLines || !db.callRecords) {
+      return { ok: false, skipped: true, reason: '记忆系统未就绪', memoryCount: 0 }
+    }
+    var record = await db.callRecords.get(Number(recordId))
+    if (!record || !ownerUid) return { ok: false, skipped: true, reason: '没有通话记录', memoryCount: 0 }
+    var settings = await getSettings(chatId)
+    if (!options.force && !settings.enabled) return { ok: false, skipped: true, reason: '自动总结未开启', memoryCount: 0 }
+    var lines = window.getCallRecordLines(record)
+    if (lines.length < 2) return { ok: false, skipped: true, reason: '通话内容太少', memoryCount: 0 }
+    var callId = Number(record.id)
+    var oldRuns = await db.memoryRuns.where('chatId').equals(chatId).filter(function(run) {
+      return Number(run.ownerUid) === Number(ownerUid) && Number(run.charId) === Number(charId) && Number(run.sourceCallId) === callId
+    }).toArray()
+    if (oldRuns.some(function(run) { return run.sourceCallLineCount === lines.length })) {
+      return { ok: true, skipped: true, alreadySummarized: true, memoryCount: 0 }
+    }
+    var raw = await window.callMemoryAI([{ role: 'user', content: buildCallSummaryPrompt(lines) }], { responseFormat: 'json_object', temperature: await window.getAITemperaturePreset('summaryMode') })
+    var parsed = extractJson(raw)
+    var memories = Array.isArray(parsed.memories) ? parsed.memories : []
+    var sourceAt = isValidTimestamp(record.createdAt) ? Number(record.createdAt) : null
+    var rows = []
+    for (var i = 0; i < memories.length; i++) {
+      var row = normalizeMemory(memories[i], { ownerUid: ownerUid, charId: charId, chatId: chatId, fromMsgId: 0, toMsgId: 0, sourceAt: sourceAt })
+      if (!row) continue
+      row.sourceType = 'call'
+      row.sourceCallId = callId
+      if (settings.embeddingEnabled) {
+        try { row.embedding = await createEmbedding(row.title + '\n' + row.content) }
+        catch (e) { console.warn('[memory] 通话记忆生成向量失败，降级保存：', e) }
+      }
+      rows.push(row)
+    }
+    if (oldRuns.length) {
+      var oldMems = await db.memories.filter(function(m) { return Number(m.sourceCallId) === callId && Number(m.ownerUid) === Number(ownerUid) }).toArray()
+      if (oldMems.length) await db.memories.bulkDelete(oldMems.map(function(m) { return m.id }))
+      await db.memoryRuns.bulkDelete(oldRuns.map(function(r) { return r.id }))
+    }
+    if (rows.length) await db.memories.bulkAdd(rows)
+    await db.memoryRuns.add({
+      ownerUid: ownerUid, charId: charId, chatId: chatId,
+      fromMsgId: 0, toMsgId: 0,
+      sourceCallId: callId, sourceCallLineCount: lines.length,
+      sourceType: 'call', sourceAt: sourceAt,
+      createdAt: Date.now(), memoryCount: rows.length, mode: 'call'
+    })
+    await db.config.put({ key: 'memoryLastSummaryAt', value: Date.now() })
+    return { ok: true, skipped: false, memoryCount: rows.length }
+  }
+
+  // 补总结：把这个聊天里所有还没总结过的旧通话逐通补上
+  async function backfillCallMemories(ownerUid, charId, chatId, onProgress) {
+    var rows = (await db.callRecords.where('chatId').equals(chatId).toArray()).filter(function(r) {
+      return Number(r.ownerUid) === Number(ownerUid) && Array.isArray(r.messages) && r.messages.length
+    }).sort(function(a, b) { return (a.createdAt || 0) - (b.createdAt || 0) })
+    var made = 0, skipped = 0, failed = 0
+    for (var i = 0; i < rows.length; i++) {
+      try {
+        var res = await summarizeCall(chatId, charId, ownerUid, rows[i].id, { force: true })
+        if (res.skipped) skipped++; else made += res.memoryCount
+      } catch (e) { failed++; console.warn('[memory] 补总结通话失败：', e) }
+      if (onProgress) onProgress(i + 1, rows.length)
+    }
+    return { total: rows.length, made: made, skipped: skipped, failed: failed }
+  }
   function getMemoryInjectionSourceAt(memory) {
     var sourceAt = Number(memory && memory.sourceAt)
     return isValidTimestamp(sourceAt) ? sourceAt : null
@@ -952,7 +1056,9 @@ ${lines}`
       var memoryTime = getMemoryInjectionSourceAt(m)
       var sourceTime = isMeet
         ? `【线下见面｜发生时间：${memoryTime ? formatMemoryDateTime(memoryTime) : '未知'}】`
-        : `【微信聊天｜发生时间：${memoryTime ? formatMemoryDateTime(memoryTime) : '未知'}】`
+                : (m.sourceType === 'call'
+          ? `【语音通话｜发生时间：${memoryTime ? formatMemoryDateTime(memoryTime) : '未知'}】`
+          : `【微信聊天｜发生时间：${memoryTime ? formatMemoryDateTime(memoryTime) : '未知'}】`)
       return `${i + 1}. ${sourceTime}${m.title}：${m.content}`
     }).join('\n')
   }
@@ -1009,7 +1115,8 @@ ${lines}`
         <div class="memory-edit-select-grid">
           <label class="memory-edit-label">来源
             <select class="input-field" id="mem-edit-source-type">
-              <option value="wechat" ${m.sourceType !== 'offlineMeet' ? 'selected' : ''}>微信</option>
+              <option value="wechat" ${m.sourceType !== 'offlineMeet' && m.sourceType !== 'call' ? 'selected' : ''}>微信</option>
+              <option value="call" ${m.sourceType === 'call' ? 'selected' : ''}>通话</option>
               <option value="offlineMeet" ${m.sourceType === 'offlineMeet' ? 'selected' : ''}>线下见面</option>
             </select>
           </label>
@@ -1049,7 +1156,7 @@ ${lines}`
         arousal: clamp(modal.querySelector('#mem-edit-arousal').value, 0, 1, 0.3),
         importance: clamp(modal.querySelector('#mem-edit-importance').value, 1, 10, 5),
         sourceAt: sourceAt,
-        sourceType: modal.querySelector('#mem-edit-source-type').value === 'offlineMeet' ? 'offlineMeet' : 'wechat',
+        sourceType: ['offlineMeet', 'call'].indexOf(modal.querySelector('#mem-edit-source-type').value) >= 0 ? modal.querySelector('#mem-edit-source-type').value : 'wechat',
         status: STATUS_LABEL[modal.querySelector('#mem-edit-status').value] ? modal.querySelector('#mem-edit-status').value : 'active',
         updatedAt: Date.now()
       }
@@ -1305,7 +1412,7 @@ ${lines}`
           <div class="memory-panel-title">记忆列表</div>
           <div class="memory-panel-actions">
             <span class="memory-panel-sub">${rows.length} 条</span>
-            ${activeRole ? '<button class="btn-ghost btn-sm" id="btn-memory-add" type="button"><i class="fa fa-plus"></i> 新增记忆</button>' : ''}
+            ${activeRole ? '<button class="btn-ghost btn-sm"   id="btn-memory-add" type="button"><i class="fa fa-plus"></i> 新增记忆</button><button class="btn-ghost btn-sm" id="btn-memory-backfill-call" type="button"><i class="fa fa-phone"></i> 补总结通话</button>' : ''}
           </div>
         </div>
         <div class="memory-list">
@@ -1340,7 +1447,7 @@ ${lines}`
     var role = chars[m.charId]
     var decay = getDecayScore(m, DEFAULT_SETTINGS).toFixed(2)
     var isMeet = m.sourceType ? m.sourceType === 'offlineMeet' : !!m.sourceSessionId
-    var sourceLabel = isMeet ? '见面' : '微信'
+    var sourceLabel = isMeet ? '见面' : (m.sourceType === 'call' ? '通话' : '微信')
     var sourceClass = sourceLabel === '见面' ? 'is-meet' : 'is-wechat'
     return `
       <div class="memory-card" data-id="${m.id}">
@@ -1405,6 +1512,22 @@ ${lines}`
       await testEmbedding()
       await renderMemoryPage(page)
     })
+          page.querySelector('#btn-memory-backfill-call')?.addEventListener('click', async function(e) {
+        var btn = e.currentTarget
+        var state = page._memoryState || {}
+        if (!state.ownerUid || !state.charId) return
+        var chat = await db.chats.where('[ownerUid+charId]').equals([state.ownerUid, state.charId]).first()
+        if (!chat) { window.toast && window.toast('未找到对应聊天'); return }
+        btn.disabled = true
+        try {
+          var r = await backfillCallMemories(state.ownerUid, state.charId, chat.id, function(done, total) {
+            btn.textContent = '补总结中 ' + done + '/' + total
+          })
+          window.toast && window.toast('补总结完成：新增 ' + r.made + ' 条记忆，跳过 ' + r.skipped + ' 通' + (r.failed ? '，失败 ' + r.failed + ' 通' : ''))
+        } catch (err) { window.toast && window.toast('补总结失败：' + (err.message || err)) }
+        btn.disabled = false
+        await renderMemoryPage(page)
+      })
     page.querySelector('#btn-memory-add')?.addEventListener('click', async function() {
       var state = page._memoryState || {}
       if (!state.ownerUid || !state.charId) return
@@ -1467,6 +1590,7 @@ ${lines}`
     summarizeIfNeeded: summarizeIfNeeded,
     summarizeNow: summarizeNow,
     summarizeMeeting: summarizeMeeting,
+    summarizeCall: summarizeCall,
     getMemoryContext: getMemoryContext,
     listMemories: listMemories,
     testEmbedding: testEmbedding,
