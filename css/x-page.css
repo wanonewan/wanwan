@@ -1599,3 +1599,135 @@
   font-weight: 700;
   cursor: pointer;
 }
+
+
+/* ===== 详情页：评论输入栏 / 回复 / 楼主标记 ===== */
+.x-detail-page { display: flex; flex-direction: column; }
+.x-detail-compose {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 2;
+  background: var(--x-bg);
+  border-top: 1px solid var(--x-border);
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0));
+}
+.x-compose-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 4px 6px 4px 12px;
+  border-radius: 12px;
+  background: var(--x-hover);
+  font-size: 13px;
+  color: var(--x-sub);
+}
+.x-compose-target[hidden] { display: none; }
+.x-compose-target span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.x-compose-target button {
+  border: 0;
+  background: transparent;
+  color: var(--x-sub);
+  font-size: 14px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.x-compose-row { display: flex; align-items: center; gap: 8px; }
+.x-compose-input {
+  flex: 1;
+  min-width: 0;
+  height: 38px;
+  box-sizing: border-box;
+  border: 1px solid var(--x-border-strong);
+  border-radius: 19px;
+  padding: 0 14px;
+  background: var(--x-bg);
+  color: var(--x-text);
+  font-family: inherit;
+  font-size: 16px;
+  outline: none;
+  -webkit-appearance: none;
+}
+.x-compose-send {
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 18px;
+  background: #1d9bf0;
+  color: #fff;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.x-compose-send:disabled { opacity: 0.4; }
+.x-comment-actions { justify-content: flex-start; gap: 18px; }
+.x-comment-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  background: transparent;
+  padding: 2px 0;
+  color: var(--x-sub);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.x-comment-btn i { font-size: 13px; }
+.x-comment-gen { color: #1d9bf0; font-weight: 600; }
+.x-comment-btn:disabled { opacity: 0.6; cursor: default; }
+.x-reply-to { color: var(--x-sub); }
+.x-badge-op {
+  display: inline-flex;
+  align-items: center;
+  height: 17px;
+  padding: 0 6px;
+  margin-left: 4px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  background: #1d9bf0;
+}
+
+/* ===== 修改角色 X 账号（顶部弹出，避免被键盘挡住） ===== */
+.x-sheet-mask.x-sheet-top {
+  align-items: flex-start;
+  box-sizing: border-box;
+  padding: calc(env(safe-area-inset-top, 0px) + 12vh) 14px 0;
+}
+.x-sheet-mask.x-sheet-top .x-sheet {
+  border-radius: 18px;
+  padding-bottom: 8px;
+  transform: translateY(16px);
+  opacity: 0;
+  transition: transform 0.22s, opacity 0.22s;
+}
+.x-sheet-mask.x-sheet-top.show .x-sheet { transform: none; opacity: 1; }
+.x-sheet-form { padding: 0 20px 6px; }
+.x-sheet-form label {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--x-sub);
+}
+.x-sheet-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 4px;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--x-border-strong);
+  border-radius: 10px;
+  background: var(--x-bg);
+  color: var(--x-text);
+  font-family: inherit;
+  font-size: 16px;
+  outline: none;
+}
+.x-sheet-hint { font-size: 12px; line-height: 1.5; color: var(--x-sub); }
