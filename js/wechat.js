@@ -7670,7 +7670,49 @@ function getCallRecordSpokenText(message) {
     return { text: looksLikeBrokenJson ? '' : raw, valid: !looksLikeBrokenJson }
   }
 }
+// 把通话记录拆成逐句 [{role, text}]（供日记/记忆使用）
+function getCallRecordLines(record) {
+  const lines = []
+  for (const message of record?.messages || []) {
+    if (isCallStartControlMessage(message)) continue
+    if (message?.role !== 'assistant' && message?.role !== 'user') continue
+    const spoken = getCallRecordSpokenText(message)
+    if (!spoken.text) continue
+    lines.push({ role: message.role, text: spoken.text })
+  }
+  return lines
+}
+window.getCallRecordLines = getCallRecordLines
 
+// 给一批聊天消息，返回 Map(消息id → {type, duration, initiator, lines})
+window.getCallLinesForMessages = async function (chatId, msgs) {
+  const out = new Map()
+  try {
+    const re = /^\[(视频通话|语音通话)\s+(\d+:[0-5]\d)\]$/
+    const marks = (msgs || []).filter(m => re.test(String(m?.content || '').trim()))
+    if (!marks.length || !db.callRecords) return out
+    const rows = await db.callRecords.where('chatId').equals(chatId).toArray()
+    const callMap = buildCallRecordMap(rows)
+    for (const m of marks) {
+      const mm = String(m.content).trim().match(re)
+      const record = findCallRecordForMessage(m, mm[1], mm[2], m.createdAt || 0, callMap)
+      if (!record) continue
+      const lines = getCallRecordLines(record)
+      if (!lines.length) continue
+      out.set(m.id, { type: mm[1], duration: mm[2], initiator: record.initiator, lines })
+    }
+  } catch (e) { console.warn('展开通话内容失败', e) }
+  return out
+}
+
+// 通话结束/恢复/续接后，让记忆系统给这通电话单独总结
+function triggerCallMemory(chatId, charId, ownerUid, recordId) {
+  if (!recordId || !window.WanWanMemory?.summarizeCall) return
+  setTimeout(() => {
+    window.WanWanMemory.summarizeCall(chatId, charId, ownerUid, recordId)
+      .catch(e => console.warn('通话记忆总结失败', e))
+  }, 0)
+}
 function buildCallRecordTranscript(record, callType, duration, fallbackRole) {
   if (!Array.isArray(record?.messages)) return null
   const initiator = record.initiator === 'char' || record.initiator === 'user'
@@ -20816,7 +20858,8 @@ async function recoverCallDraft() {
         initiator: draft.initiator || 'user', duration, messages: msgs, msgTime: endAt
       })
       if (merged) {
-        window.toast?.('上次没挂断的通话已自动保存')
+              triggerCallMemory(draft.chatId, draft.charId, draft.ownerUid, callRecordId)
+      window.toast?.('上次没挂断的通话已自动保存')
         if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
         await clearCallDraft()
         return
@@ -22020,7 +22063,8 @@ async function mergeResumedCall(recordId, info) {
   try {
     const old = await db.callRecords.get(recordId)
     if (!old) return false
-    await db.callRecords.update(recordId, { duration: info.duration, messages: info.messages })
+        await db.callRecords.update(recordId, { duration: info.duration, messages: info.messages })
+    triggerCallMemory(old.chatId, old.charId, old.ownerUid, recordId)
     const mm = String(Math.floor(info.duration / 60)).padStart(2, '0')
     const ss = String(info.duration % 60).padStart(2, '0')
     const typeLabel = info.type === 'video' ? '视频通话' : '语音通话'
@@ -22246,7 +22290,7 @@ async function endCall(opts = {}) {
       } catch (e) {
         console.error('保存通话记录失败', e)
       }
-
+      triggerCallMemory(chatId, charId, window._wechatUid, callRecordId)
       try {
         const typeLabel = type === 'video' ? '视频通话' : '语音通话'
         const msgRole = initiator === 'char' ? 'assistant' : 'user'
