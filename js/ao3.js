@@ -260,10 +260,10 @@
   // ===== 套话句式检测与润色 =====
   // 只检查叙述，不检查台词（“ ”「 」『 』里的内容），人说话偶尔这么讲是正常的
   const CONTRAST_RES = [
-    /(?:并不是|并非|不是|不只是|不仅仅是|不单单是|不光是)[^。！？!?\n]{1,40}?(?:而是|[，,；;：:—…]+\s*(?:这?是(?!否)|更是|只是|就是|才是|不过是|只不过是|仅仅是|倒是|反而是))/g,
+    /(?:并不是|并非|不是|不只是|不仅仅是|不单单是|不光是)[^。！？!?\n]{1,40}?(?:而是|[，,；;：:—…\n]+\s*(?:这?是(?!否)|更是|只是|就是|才是|不过是|只不过是|仅仅是|倒是|反而是))/g,
     /(?:并不是|并非|不是)[^。！？!?\n]{1,30}[。！？!?]+\s*(?:而是|只是|就是|才是|这是|是(?![的否]))/g,
     /与其说[^。！？!?\n]{1,40}?[，,；;]\s*(?:倒)?不如说/g,
-    /(?:没有|不再是)[^。！？!?\n，,；;]{1,25}[，,；;]\s*(?:只有|只剩|有的只是)/g
+    /(?:没有|不再是)[^。！？!?\n，,；;]{1,25}[，,；;]\s*(?:(?:没有|不再是)[^。！？!?\n，,；;]{1,25}[，,；;]\s*)?(?:只有|只剩|有的只是)/g
   ]
   const WHY_RE = /怎么[^。！？!?\n]{1,18}?[，,；;、。]\s*(?:又|也|还|就)?怎么/g
 
@@ -313,36 +313,59 @@
     return flagged
   }
 
-  // 只把命中的段落发给 AI 改写，其余原样不动。改写不合格（改了台词、长度悬殊、问题没少）就保留原文
+  // 改写结果是否合格；返回空字符串表示合格，否则返回原因
+  function polishCheck(old, neu) {
+    if (!neu) return '没返回'
+    const ratio = neu.length / Math.max(1, old.length)
+    // 很短的段落（如“不是疼，是空。”）本来就只有几个字，放宽长度限制
+    if (old.length <= 40 ? (neu.length < 2 || ratio > 3.5) : (ratio < 0.5 || ratio > 1.6)) return '长度不合格'
+    if (quotesOf(neu) !== quotesOf(old)) return '改了对白'
+    if (findHits(maskQuotes(neu)).length >= findHits(maskQuotes(old)).length) return '句式没减少'
+    return ''
+  }
+
+  const POLISH_SYS = '你是小说文字编辑。下面是若干段小说正文，每段含有生硬的“对比转折”句（如“不是……而是……”“不是……，是……”“不是……，就是……”“与其说……不如说……”“没有……只有……”）或“怎么……怎么……”排比句。请改写这些段落：\n①把有问题的句子改成直接陈述——只写真实的那一面，删掉被否定的那一半，必要时用一个具体的动作或细节代替（例：“不是亲，就是贴着”可改成“他的唇贴在她颈窝里，没有动，鼻尖轻轻吸了口气”；很短的“不是疼，是空。”可结合上文改成“胸口空落落的。”）；\n②不要用别的对比句或排比句来顶替；\n③除有问题的句子外，其余文字、人名、事实、对白（引号“ ”里的内容）一字不改；\n④保持原文的语气和人称。\n每段前面可能带有【上文】，只是帮你理解语境，不要输出；只输出【待改】那一段改写后的结果（不要带标签）。\n输出格式严格为：\n===编号===\n改写后的整段\n（每段一个编号，不要任何额外说明）'
+
+  async function askRewrite(paras, idxs, strict) {
+    const text = idxs.map((pi, k) => `===${k + 1}===\n` + (pi > 0 ? `【上文（只供参考，不要输出）】${paras[pi - 1].slice(-150)}\n` : '') + `【待改】${paras[pi]}`).join('\n\n')
+    let raw = ''
+    try {
+      raw = await window.callAI([{ role: 'user', content: text }], {
+        system: POLISH_SYS + (strict ? '\n⑤这些段落上一次没改成功。这次必须把有问题的句子彻底重写成直接陈述，可以结合上文把意思写具体，不要原样返回。' : ''),
+        temperature: strict ? 0.8 : 0.6
+      })
+    } catch (e) { console.warn('[ao3] 润色调用失败', e); return {} }
+    const got = parseNumbered(raw)
+    const out = {}
+    idxs.forEach((pi, k) => {
+      if (got[k + 1]) out[pi] = got[k + 1].replace(/^【待改】\s*/, '').replace(/^【上文[^】]*】[^\n]*\n?/, '').trim()
+    })
+    return out
+  }
+
+  // 只把命中的段落发给 AI 改写，其余原样不动。第一轮 6 段一批；没改成的再单独加强重试一轮。
+  // 改写不合格（改了台词、长度不对、句式没减少）就保留原文，并返回失败原因
   async function polishBody(body) {
     const paras = normalizeBody(body).split(/\n{2,}/)
     const flagged = flagParas(paras).slice(0, 12)
-    if (!flagged.length || typeof window.callAI !== 'function') return { body: normalizeBody(body), fixed: 0 }
+    if (!flagged.length || typeof window.callAI !== 'function') return { body: paras.join('\n\n'), fixed: 0, failed: [] }
     let fixed = 0
-    for (let b = 0; b < flagged.length; b += 6) {
-      const batch = flagged.slice(b, b + 6)
-      const text = batch.map((pi, k) => `===${k + 1}===\n${paras[pi]}`).join('\n\n')
-      let raw = ''
-      try {
-        raw = await window.callAI([{ role: 'user', content: text }], {
-          system: '你是小说文字编辑。下面是若干段小说正文，每段含有生硬的“对比转折”句（如“不是……而是……”“不是……，是……”“与其说……不如说……”“没有……只有……”）或“怎么……怎么……”排比句。请改写这些段落：\n①把有问题的句子改成直接陈述——只写真实的那一面，删掉被否定的那一半，必要时用一个具体的动作或细节代替（例：“不是亲，就是贴着”可改成“他的唇贴在她颈窝里，没有动，鼻尖轻轻吸了口气”）；\n②不要用别的对比句或排比句来顶替；\n③除有问题的句子外，其余文字、人名、事实、对白（引号“ ”里的内容）一字不改，段落长度与原来相近；\n④保持原文的语气和人称。\n输出格式严格为：\n===编号===\n改写后的整段\n（每段一个编号，不要任何额外说明）',
-          temperature: 0.6
+    let pending = flagged
+    const lastWhy = {}
+    for (let round = 0; round < 2 && pending.length; round++) {
+      const size = round === 0 ? 6 : 3
+      const next = []
+      for (let b = 0; b < pending.length; b += size) {
+        const batch = pending.slice(b, b + size)
+        const got = await askRewrite(paras, batch, round === 1)
+        batch.forEach(pi => {
+          const why = polishCheck(paras[pi], got[pi])
+          if (!why) { paras[pi] = got[pi]; fixed++ } else { next.push(pi); lastWhy[pi] = why }
         })
-      } catch (e) { console.warn('[ao3] 润色调用失败', e); continue }
-      const got = parseNumbered(raw)
-      batch.forEach((pi, k) => {
-        const neu = got[k + 1]
-        const old = paras[pi]
-        if (!neu) return
-        const ratio = neu.length / Math.max(1, old.length)
-        if (ratio < 0.5 || ratio > 1.6) return
-        if (quotesOf(neu) !== quotesOf(old)) return
-        if (findHits(maskQuotes(neu)).length >= findHits(maskQuotes(old)).length) return
-        paras[pi] = neu
-        fixed++
-      })
+      }
+      pending = next
     }
-    return { body: paras.join('\n\n'), fixed }
+    return { body: paras.join('\n\n'), fixed, failed: pending.map(pi => lastWhy[pi]) }
   }
 
   // ===== 生成 =====
@@ -768,6 +791,7 @@
     })
     main.querySelector('#ao3-retry')?.addEventListener('click', () => generate(w.id, 'new'))
     bindTtsUI(main)
+    bindSelectionBar()
     page.querySelector('#ao3-read-actions').onclick = async e => {
       const b = e.target.closest('[data-act]')
       if (!b || b.disabled) return
@@ -1272,6 +1296,190 @@
     window.toast?.(`已删除 ${removed} 章`)
   }
 
+  // ===== 选中文字 → 改写 / 手动修改 =====
+  // 阅读页里选中正文，底部浮出工具栏；也可以在「本章管理 → 编辑本章全文」里直接改。
+  // 编辑框里的文字选择在 iPhone 上比正文里稳定得多。
+  let selBound = false
+  let selCache = ''
+  let selLock = 0
+  let selTimer = null
+
+  function ensureEditStyle() {
+    if (document.getElementById('ao3-edit-style')) return
+    const st = document.createElement('style')
+    st.id = 'ao3-edit-style'
+    st.textContent = '#ao3-read-page .ao3-chapter-body,#ao3-read-page .ao3-chapter-body *{-webkit-user-select:text!important;user-select:text!important;-webkit-touch-callout:default!important}' +
+      '#ao3-sel-bar{position:absolute;left:10px;right:10px;z-index:60;display:none;align-items:center;gap:10px;padding:8px 10px;background:#fff;color:#2a2a2a;border:1px solid #bbb;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);font-size:13px}' +
+      '#ao3-sel-bar button{background:#900;color:#fff;border:0;border-radius:6px;padding:7px 12px;font-size:13px}'
+    document.head.appendChild(st)
+  }
+
+  function updateSelBar() {
+    const page = document.getElementById('ao3-read-page')
+    const bar = page && page.querySelector('#ao3-sel-bar')
+    if (!page || !bar) return
+    const hide = () => { if (Date.now() - selLock > 1500) bar.style.display = 'none' }
+    const sel = window.getSelection && window.getSelection()
+    const body = page.querySelector('.ao3-chapter-body')
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !body) { hide(); return }
+    if (!body.contains(sel.getRangeAt(0).commonAncestorContainer)) { hide(); return }
+    const t = sel.toString().trim()
+    if (t.length < 2) { hide(); return }
+    selCache = t
+    const actions = page.querySelector('#ao3-read-actions')
+    if (actions && actions.parentElement) {
+      const par = actions.parentElement
+      if (getComputedStyle(par).position === 'static') par.style.position = 'relative'
+      bar.style.bottom = (par.clientHeight - actions.offsetTop + 6) + 'px'
+    }
+    bar.querySelector('.cnt').textContent = `已选 ${t.length} 字`
+    bar.style.display = 'flex'
+  }
+
+  function bindSelectionBar() {
+    ensureEditStyle()
+    const page = document.getElementById('ao3-read-page')
+    if (!page) return
+    if (!page.querySelector('#ao3-sel-bar')) {
+      const bar = document.createElement('div')
+      bar.id = 'ao3-sel-bar'
+      bar.innerHTML = '<span class="cnt" style="flex:1;opacity:.7"></span><button type="button" id="ao3-sel-edit">改写 / 修改选中</button>'
+      bar.addEventListener('touchstart', () => { selLock = Date.now() }, { passive: true })
+      bar.addEventListener('mousedown', e => e.preventDefault())
+      bar.querySelector('#ao3-sel-edit').addEventListener('click', () => {
+        const w = getWork(readState.id)
+        const t = selCache
+        try { window.getSelection().removeAllRanges() } catch (_) {}
+        bar.style.display = 'none'
+        if (w && t) openChapterEditor(w, readState.ci, t)
+      })
+      page.appendChild(bar)
+    }
+    if (!selBound) {
+      selBound = true
+      document.addEventListener('selectionchange', () => { clearTimeout(selTimer); selTimer = setTimeout(updateSelBar, 120) })
+    }
+  }
+
+  // 在原文里找到选中的文字（容忍换行、粗体星号的差异）
+  function locateRange(raw, sel) {
+    const chars = Array.from(String(sel).replace(/\s+/g, ''))
+    if (!chars.length) return []
+    const re = new RegExp(chars.map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[\\s*]*'), 'g')
+    const found = []
+    let m
+    while ((m = re.exec(raw)) && found.length < 3) {
+      if (!m[0].length) { re.lastIndex++; continue }
+      found.push([m.index, m.index + m[0].length])
+    }
+    return found
+  }
+
+  function openChapterEditor(w, ci, selText) {
+    if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
+    const page = document.getElementById('ao3-read-page')
+    if (!page || page.querySelector('.ao3-ed-pad')) return
+    const cur = (w.chapters || [])[ci]
+    if (!cur) return
+    const raw = normalizeBody(cur.body)
+    let ls = { s: 0, e: 0 }
+    if (selText) {
+      const found = locateRange(raw, String(selText).slice(0, 3000))
+      if (found.length === 1) ls = { s: found[0][0], e: found[0][1] }
+      else if (found.length > 1) { window.toast?.('选中的这段在本章里出现了多次，请多选几个字再试'); return }
+      else window.toast?.('没能在原文里定位到选中的文字，已打开整章编辑，请在框里自己选一下')
+    }
+    ttsStop(true)
+    const titleShort = String(cur.title || '').replace(/ · .*/, '')
+    const bd = document.createElement('div')
+    bd.className = 'ao3-continue-backdrop ao3-ed-pad show'
+    bd.innerHTML = `
+      <div class="ao3-continue-card">
+        <h2>${esc(titleShort)} · 编辑</h2>
+        <p class="ao3-continue-tip">可以直接手动修改；也可以在下面文本框里选中一段文字，再点「AI 改写选中部分」。改完点「保存修改」才会生效。</p>
+        <textarea id="ao3-ed-ta" class="ao3-textarea" style="height:240px;font-size:14px;line-height:1.6"></textarea>
+        <p class="ao3-continue-tip" id="ao3-ed-st" style="margin:6px 0 0"></p>
+        <input id="ao3-ed-ins" type="text" class="ao3-textarea" style="width:100%;box-sizing:border-box;height:auto;min-height:0;padding:8px;margin-top:8px" placeholder="想怎么改？留空 = 去掉套话句式，直接陈述">
+        <button type="button" class="ao3-btn-ghost" id="ao3-ed-ai" style="width:100%;margin-top:8px">AI 改写选中部分</button>
+        <div id="ao3-ed-prev" style="margin-top:8px;font-size:13px;line-height:1.6"></div>
+        <div class="ao3-continue-btns" style="margin-top:10px"><button type="button" class="ao3-btn-ghost" id="ao3-ed-cancel" style="flex:1">取消</button><button type="button" class="ao3-submit" id="ao3-ed-save" style="flex:1">保存修改</button></div>
+      </div>`
+    page.appendChild(bd)
+    const ta = bd.querySelector('#ao3-ed-ta')
+    const st = bd.querySelector('#ao3-ed-st')
+    const prev = bd.querySelector('#ao3-ed-prev')
+    const aiBtn = bd.querySelector('#ao3-ed-ai')
+    ta.value = raw
+    const showSt = () => {
+      const n = ls.e - ls.s
+      st.textContent = n > 0 ? `当前选中 ${n} 字：${ta.value.slice(ls.s, ls.e).replace(/\s+/g, ' ').slice(0, 30)}${n > 30 ? '…' : ''}` : '还没有选中文字'
+    }
+    showSt()
+    if (ls.e > ls.s) setTimeout(() => { try { ta.scrollTop = Math.max(0, ls.s / Math.max(1, raw.length) * ta.scrollHeight - 60) } catch (_) {} }, 50)
+    const grab = () => { if (ta.selectionEnd > ta.selectionStart) { ls = { s: ta.selectionStart, e: ta.selectionEnd }; showSt() } }
+    ;['select', 'keyup', 'touchend', 'mouseup', 'blur'].forEach(ev => ta.addEventListener(ev, grab))
+    ta.addEventListener('input', () => { ls = { s: 0, e: 0 }; showSt(); prev.innerHTML = '' })
+    bd.querySelector('#ao3-ed-cancel').addEventListener('click', () => {
+      if (ta.value !== raw && !window.confirm('有未保存的修改，确定放弃吗？')) return
+      bd.remove()
+    })
+    bd.querySelector('#ao3-ed-save').addEventListener('click', async () => {
+      const nb = normalizeBody(ta.value)
+      if (!nb.trim()) { window.toast?.('正文不能为空'); return }
+      cur.body = nb
+      w.words = workWords(w)
+      await persist()
+      const m = document.getElementById('ao3-read-main')
+      const top = m ? m.scrollTop : 0
+      bd.remove()
+      renderReader()
+      if (m) m.scrollTop = top
+      refreshList()
+      window.toast?.('已保存')
+    })
+
+    let working = false
+    const run = async () => {
+      if (working) return
+      const { s, e } = ls
+      if (e - s < 1) { window.toast?.('请先在文本框里选中一段文字'); return }
+      if (typeof window.callAI !== 'function') { window.toast?.('请先在设置里配置 API'); return }
+      working = true
+      aiBtn.disabled = true
+      aiBtn.textContent = '改写中…'
+      prev.innerHTML = ''
+      const full = ta.value
+      const frag = full.slice(s, e)
+      const ins = bd.querySelector('#ao3-ed-ins').value.trim() || '去掉“不是……而是……”“怎么……怎么……”这类套话句式，改成直接陈述，保持原意'
+      let out = ''
+      try {
+        const rawOut = await window.callAI([{ role: 'user', content: `【上文】${full.slice(Math.max(0, s - 400), s)}\n【待改片段】${frag}\n【下文】${full.slice(e, e + 200)}\n【修改要求】${ins}` }], {
+          system: '你是小说文字编辑。用户会给出小说的【上文】【待改片段】【下文】和【修改要求】。请只改写【待改片段】：\n①严格按【修改要求】改；没有特别要求的地方保持原意、人称、语气和人名；\n②只输出改写后的片段本身，不要标签、引号包裹、解释或代码块；\n③不要写出【上文】【下文】里的内容；\n④不要使用“不是……而是……”“不是……，是……”这类对比转折句，也不要“怎么……怎么……”排比；\n⑤长度与原片段大致相近，除非修改要求另有说明。',
+          temperature: 0.8
+        })
+        out = String(rawOut || '').replace(/```[a-zA-Z]*\n?/g, '').replace(/^【待改片段】\s*/, '').split(/\n?【(?:下文|修改要求)】/)[0].trim()
+      } catch (err) { console.warn('[ao3] 片段改写失败', err) }
+      working = false
+      aiBtn.disabled = false
+      aiBtn.textContent = 'AI 改写选中部分'
+      if (!out) { window.toast?.('改写失败，请再试一次'); return }
+      prev.innerHTML = `<div style="opacity:.6">原文</div><div>${esc(frag)}</div><div style="opacity:.6;margin-top:6px">改写后</div><div style="color:#900">${esc(out)}</div>` +
+        '<div class="ao3-continue-btns" style="margin-top:8px"><button type="button" class="ao3-btn-ghost" id="ao3-ed-no" style="flex:1">放弃</button><button type="button" class="ao3-btn-ghost" id="ao3-ed-again" style="flex:1">再来一次</button><button type="button" class="ao3-submit" id="ao3-ed-yes" style="flex:1">替换</button></div>'
+      prev.querySelector('#ao3-ed-no').addEventListener('click', () => { prev.innerHTML = '' })
+      prev.querySelector('#ao3-ed-again').addEventListener('click', run)
+      prev.querySelector('#ao3-ed-yes').addEventListener('click', () => {
+        let at = ta.value.slice(s, e) === frag ? s : ta.value.indexOf(frag)
+        if (at < 0) { window.toast?.('原文已被改动，找不到要替换的位置，请重新选一下'); return }
+        ta.value = ta.value.slice(0, at) + out + ta.value.slice(at + frag.length)
+        ls = { s: at, e: at + out.length }
+        showSt()
+        prev.innerHTML = ''
+        window.toast?.('已替换，记得点「保存修改」')
+      })
+    }
+    aiBtn.addEventListener('click', () => { grab(); run() })
+  }
+
   // ===== 全文自检：把所有章节里的套话句式找出来并润色 =====
   async function polishWholeWork(w, bd) {
     if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
@@ -1286,11 +1494,12 @@
     busy = true
     ttsStop(true)
     let fixed = 0
+    const failedWhy = []
     try {
       for (let i = 0; i < chaps.length; i++) {
         if (!plan[i]) continue
         window.toast?.(`正在润色第 ${i + 1}/${chaps.length} 章…`)
-        try { const r = await polishBody(chaps[i].body); if (r.fixed) { chaps[i].body = r.body; fixed += r.fixed; await persist() } } catch (e) { console.warn('[ao3] 全文润色失败', e) }
+        try { const r = await polishBody(chaps[i].body); failedWhy.push(...r.failed); if (r.fixed) { chaps[i].body = r.body; fixed += r.fixed; await persist() } } catch (e) { console.warn('[ao3] 全文润色失败', e) }
       }
       w.words = workWords(w)
       await persist()
@@ -1299,7 +1508,10 @@
       renderReader()
       refreshList()
     }
-    window.toast?.(fixed ? `已润色 ${fixed} 段` + (plan.some(n => n > 12) ? '，部分章节还有剩余，可以再点一次' : '') : '没能改成功（接口失败或改写不合格），原文已保留，可以再试一次')
+    const cnt = {}
+    failedWhy.forEach(x => { cnt[x] = (cnt[x] || 0) + 1 })
+    const whyTxt = Object.keys(cnt).map(k => `${k}${cnt[k]}`).join('、')
+    window.toast?.((fixed ? `已润色 ${fixed} 段` : '没能改成功') + (failedWhy.length ? `，另有 ${failedWhy.length} 段没改成（${whyTxt}），原文已保留，可用「编辑本章全文」手动处理` : '') + (plan.some(n => n > 12) ? '；部分章节还有剩余，可以再点一次' : ''))
   }
 
   function openChapterPad(w) {
@@ -1324,6 +1536,10 @@
         <textarea id="ao3-rw-dir" class="ao3-textarea" placeholder="想怎么改？可以留空，会承接上一章重新写一个不同的版本">${esc(dir)}</textarea>
         <button type="button" class="ao3-submit" id="ao3-rw-go" style="margin-top:8px">重写${esc(titleShort)}${later ? `（并删除后面 ${later} 章）` : ''}</button>
         <div class="ao3-pad-sep"></div>
+        <label class="ao3-continue-label">手动编辑</label>
+        <p class="ao3-continue-tip">整章放进文本框里自己改，也可以选中一段让 AI 只改那一段。</p>
+        <button type="button" class="ao3-btn-ghost" id="ao3-edit-go" style="width:100%">编辑本章全文</button>
+        <div class="ao3-pad-sep"></div>
         <label class="ao3-continue-label">自检全文套话句式</label>
         <p class="ao3-continue-tip">检查本篇所有章节里“不是…而是…”“怎么…怎么…”这类句式，只改写命中的段落。</p>
         <button type="button" class="ao3-btn-ghost" id="ao3-polish-go" style="width:100%">自检并润色全文</button>
@@ -1342,6 +1558,7 @@
       ttsStop(true)
       generate(w.id, 'rewrite', { rewriteAt: ci, direction })
     })
+    bd.querySelector('#ao3-edit-go').addEventListener('click', () => { bd.remove(); openChapterEditor(w, ci, null) })
     bd.querySelector('#ao3-polish-go').addEventListener('click', () => polishWholeWork(w, bd))
     bd.querySelector('#ao3-chap-del').addEventListener('click', () => {
       if (ci === 0) return
