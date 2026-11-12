@@ -16,27 +16,12 @@ var xGenBusy = 0           // 角色发帖 / 路人帖 正在生成的任务数
 var xFeedTab = 'foryou'
 var xComposeAnon = false
 
-var X_TOPICS_ASK = [
-  '求推荐（好物 / 店 / 软件 / 课程）', '购物避雷求助', '职场或学校遇到的难题', '情感或人际关系困惑',
-  '租房 / 搬家 / 装修踩坑求助', '学习方法或备考求助', '作息健康问题（失眠 / 减肥 / 护肤）', '做饭翻车求救',
-  '旅行攻略求助', '电子产品或软件使用问题', '养猫养狗养植物的问题', '要不要……的纠结（辞职 / 考研 / 买房等）',
-  '值不值得买的消费决策', '社交场合的尴尬怎么处理'
+var X_TOPICS = [
+  '生活吐槽', '经验分享', '寻求帮助（求推荐/求建议）', '记录生活（日常碎碎念）',
+  '职场或学校吐槽', '美食探店或做饭翻车', '追剧/游戏/追星', '情感树洞',
+  '搞笑段子', '随手拍配文', '购物避雷', '熬夜失眠碎碎念',
+  '旅行见闻', '养猫养狗日常', '学习打卡', '冷知识科普'
 ]
-var X_TOPICS_SHARE = [
-  '踩坑后的经验总结', '好物或店铺安利', '学习打卡与方法分享', '做饭 / 探店记录', '旅行见闻与攻略', '生活小窍门'
-]
-var xReplyTarget = null    // 详情页底部输入栏当前要回复的评论
-var xReplyBusy = {}        // 正在生成回复的评论 id
-
-// 评论风格说明（mode: 'ask' / 'share' / 其他=都兼顾）
-function xCommentStyle(mode) {
-  var ask = '以认真回答为主（给具体建议、讲亲身经历、推荐具体做法 / 产品 / 地点），也夹杂追问细节、共鸣「我也这样」、不同意见、抬杠、跑题和「码住」「蹲一个」之类的水评；'
-  var share = '以补充经验、感谢、提问、共鸣、调侃为主；'
-  var tail = '语气各异，小红书式口吻（姐妹、宝子、亲测、避雷等适度出现，别每条都用），可带 emoji，不要客套，不要全用同一种句式，不要 AI 腔。'
-  if (mode === 'ask') return '提问帖的评论' + ask + tail
-  if (mode === 'share') return '分享帖的评论' + share + tail
-  return '若帖子是提问求助，评论' + ask + '若是分享或日常，评论' + share + tail
-}
 
 window.showXPage = async function() {
   var user = await getXSessionUser()
@@ -146,14 +131,6 @@ async function renderXPage(user) {
     var postEl = e.target.closest('.x-post')
     if (!postEl) return
     var id = postEl.dataset.id
-    if (e.target.closest('.x-post-avatar')) {
-      var avPost = findXPost(id)
-      if (avPost && avPost.kind === 'char') {
-        e.stopPropagation()
-        showXAccountEdit(avPost.authorId)
-        return
-      }
-    }
     if (e.target.closest('.x-post-action.like')) {
       e.stopPropagation()
       toggleXLike(id, null, e.target.closest('.x-post-action.like'))
@@ -410,38 +387,20 @@ function buildXPostFromData(p, opts) {
   })
 }
 
-function buildXComment(c, list) {
+function buildXComment(c) {
   var count = (c.likes || 0) + (c.liked ? 1 : 0)
-  var isUser = c.kind === 'user'
-  var content = formatXContent(c.content)
-  if (c.replyTo && c.replyTo.handle) {
-    content = '<span class="x-reply-to">回复 <span class="x-hashtag">@' + xEscape(stripXAt(c.replyTo.handle)) + '</span></span> ' + content
-  }
-  var btns = ''
-  if (isUser) {
-    var busy = !!xReplyBusy[c.id]
-    var replied = (list || []).some(function(x) { return x.replyTo && x.replyTo.id === c.id })
-    btns = '<button class="x-comment-btn x-comment-gen" type="button"' + (busy ? ' disabled' : '') + '>' +
-      (busy ? '<i class="fa fa-spinner fa-spin"></i> 回复生成中…' : '<i class="fa-solid fa-wand-magic-sparkles"></i> ' + (replied ? '再生成回复' : '生成回复')) +
-      '</button>'
-  } else {
-    btns = '<button class="x-comment-btn x-comment-reply" type="button"><i class="fa-regular fa-comment-dots"></i> 回复</button>'
-  }
   return '<div class="x-post x-comment" data-cid="' + xEscape(c.id) + '">' +
     '<div class="x-post-avatar">' + xAvatarHTML(c) + '</div>' +
     '<div class="x-post-body">' +
       '<div class="x-post-header">' +
         '<span class="x-post-name">' + xEscape(c.name) + '</span>' +
-        (isUser ? '<span class="x-badge-mine">我</span>' : '') +
-        (c.isOp ? '<span class="x-badge-op">楼主</span>' : '') +
         '<span class="x-post-handle">@' + xEscape(stripXAt(c.handle)) + '</span>' +
         '<span class="x-post-dot">·</span>' +
         '<span class="x-post-time">' + xEscape(xTimeLabel(c.ts)) + '</span>' +
       '</div>' +
-      '<div class="x-post-content">' + content + '</div>' +
+      '<div class="x-post-content">' + formatXContent(c.content) + '</div>' +
       '<div class="x-post-actions x-comment-actions">' +
         '<button class="x-post-action like' + (c.liked ? ' liked' : '') + '" type="button">' + getXHeartSvg(!!c.liked) + '<span>' + formatXNumber(count) + '</span></button>' +
-        btns +
       '</div>' +
     '</div>' +
   '</div>'
@@ -494,7 +453,6 @@ function deleteXPost(id) {
 function openXPostDetail(id) {
   var post = findXPost(id)
   if (!post) return
-  xReplyTarget = null
   var existing = document.getElementById('x-post-detail')
   if (existing) existing.remove()
 
@@ -507,14 +465,7 @@ function openXPostDetail(id) {
       '<button class="x-detail-back" type="button" aria-label="返回"><i class="fa-solid fa-arrow-left"></i></button>' +
       '<div class="x-detail-title">帖子</div>' +
     '</div>' +
-    '<div class="x-detail-scroll"></div>' +
-    '<div class="x-detail-compose">' +
-      '<div class="x-compose-target" hidden><span></span><button type="button" aria-label="取消回复"><i class="fa-solid fa-xmark"></i></button></div>' +
-      '<div class="x-compose-row">' +
-        '<input class="x-compose-input" type="text" enterkeyhint="send" maxlength="300" placeholder="发表你的评论" autocomplete="off">' +
-        '<button class="x-compose-send" type="button" disabled>发送</button>' +
-      '</div>' +
-    '</div>'
+    '<div class="x-detail-scroll"></div>'
 
   if (window.openPage) {
     window.openPage(page)
@@ -533,31 +484,13 @@ function openXPostDetail(id) {
 
   page.querySelector('.x-detail-scroll').addEventListener('click', function(e) {
     var pid = page.dataset.postId
-    var post = findXPost(pid)
     var commentEl = e.target.closest('.x-comment')
     if (commentEl) {
-      var cid = commentEl.dataset.cid
-      var cmt = xFindComment(post, cid)
-      if (!cmt) return
       var likeBtn = e.target.closest('.x-post-action.like')
       if (likeBtn) {
         e.stopPropagation()
-        toggleXLike(pid, cid, likeBtn)
-      } else if (e.target.closest('.x-comment-gen')) {
-        e.stopPropagation()
-        generateXCommentReplies(xCurrentUser, xForumData, pid, cid)
-      } else if (e.target.closest('.x-comment-reply')) {
-        e.stopPropagation()
-        setXReplyTarget(page, cmt)
-      } else if (e.target.closest('.x-post-avatar') && cmt.kind === 'char') {
-        e.stopPropagation()
-        showXAccountEdit(cmt.authorId)
+        toggleXLike(pid, commentEl.dataset.cid, likeBtn)
       }
-      return
-    }
-    if (e.target.closest('.x-post-avatar') && post && post.kind === 'char') {
-      e.stopPropagation()
-      showXAccountEdit(post.authorId)
       return
     }
     if (e.target.closest('.x-post-action.like')) {
@@ -570,8 +503,6 @@ function openXPostDetail(id) {
       showXPostMenu(pid)
     }
   })
-
-  bindXDetailCompose(page)
 }
 
 function renderXDetail(page) {
@@ -592,7 +523,7 @@ function renderXDetail(page) {
     buildXPostFromData(post, { detail: true }) +
     '<div class="x-detail-meta">' + xEscape(xFullTime(post.ts)) + ' · <b>' + formatXNumber(post.views || 0) + '</b> 次查看</div>' +
     '<div class="x-detail-replies-title">' + title + '</div>' +
-    comments.map(function(c) { return buildXComment(c, comments) }).join('')
+    comments.map(buildXComment).join('')
   scroll.scrollTop = top
 }
 
@@ -913,7 +844,7 @@ async function generateXUserPostReplies(user, data, postId) {
   var post = findXPost(postId, data)
   if (!post) return
   try {
-    var n = xRand(6, 10)
+    var n = xRand(8, 12)
     var cands = []
     if (!post.anon) {
       var friends = await loadXFriendChars(user)
@@ -922,9 +853,10 @@ async function generateXUserPostReplies(user, data, postId) {
     }
 
     var system =
-      '你在模拟一个中文问答社区（风格类似小红书：大家发帖提问、求助、分享经验，评论区热心回答；界面是 X 的样子）的评论区，扮演一大群互不相识的路人网友。\n' +
-      '请为下面这条帖子写 ' + n + ' 条路人评论。每条来自不同网友：网名 2-8 字，@用户名为英文数字下划线，评论 20-150 字，长短不一。' +
-      xCommentStyle() + '评论紧扣帖子内容，但允许个别跑题。路人不认识发帖人。\n'
+      '你在模拟大型中文社交平台 X（推特）的评论区，扮演一大群互不相识的路人网友。\n' +
+      '请为下面这条帖子写 ' + n + ' 条路人评论。每条来自不同网友：网名 2-8 字，@用户名为英文数字下划线；' +
+      '语气各异：赞同、玩梗、抬杠、追问、共鸣、跑题、无意义水评、偶尔复读或小广告；长短不一（5-60 字），口语化，' +
+      '不要 AI 腔，不要客套，不要全用同一种句式。评论紧扣帖子内容，但允许个别跑题。路人不认识发帖人。\n'
 
     if (cands.length) {
       var uName = getXUserName(user)
@@ -952,7 +884,7 @@ async function generateXUserPostReplies(user, data, postId) {
     var charMap = {}
     cands.forEach(function(ch) { charMap[String(ch.id)] = ch })
     var accounts = ensureXAccounts(data, cands, parsed.accounts)
-    post.comments = (post.comments || []).concat(buildXComments(parsed.loose, post.ts, charMap, accounts, n + 3, 2))
+    post.comments = buildXComments(parsed.loose, post.ts, charMap, accounts, n + 3, 2)
 
     var st = xGenStats()
     post.views = st.views
@@ -966,238 +898,6 @@ async function generateXUserPostReplies(user, data, postId) {
     await saveXForum(data)
     refreshXViews(data, postId)
   }
-}
-
-/* ============================================================
-   评论区：用户评论 / 回复评论 / 生成回复
-   ============================================================ */
-function xFindComment(post, cid) {
-  if (!post || !cid) return null
-  var list = post.comments || []
-  for (var i = 0; i < list.length; i++) {
-    if (list[i].id === cid) return list[i]
-  }
-  return null
-}
-
-function setXReplyTarget(page, cmt) {
-  xReplyTarget = cmt ? { id: cmt.id, name: cmt.name, handle: stripXAt(cmt.handle) } : null
-  var chip = page.querySelector('.x-compose-target')
-  var input = page.querySelector('.x-compose-input')
-  if (chip) {
-    chip.hidden = !xReplyTarget
-    chip.querySelector('span').textContent = xReplyTarget ? '回复 ' + xReplyTarget.name + ' @' + xReplyTarget.handle : ''
-  }
-  if (input) {
-    input.placeholder = xReplyTarget ? '回复 @' + xReplyTarget.handle : '发表你的评论'
-    if (xReplyTarget) input.focus()
-  }
-}
-
-function bindXDetailCompose(page) {
-  var input = page.querySelector('.x-compose-input')
-  var send = page.querySelector('.x-compose-send')
-  var chip = page.querySelector('.x-compose-target')
-  var bar = page.querySelector('.x-detail-compose')
-  if (!input || !send) return
-
-  function sync() { send.disabled = !input.value.trim() }
-  async function doSend() {
-    var text = input.value.trim().slice(0, 300)
-    if (!text) return
-    input.value = ''
-    sync()
-    await sendXUserComment(page.dataset.postId, text)
-    setXReplyTarget(page, null)
-  }
-  input.addEventListener('input', sync)
-  input.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
-      e.preventDefault()
-      doSend()
-    }
-  })
-  send.addEventListener('click', function(e) { e.preventDefault(); doSend() })
-  chip.querySelector('button').addEventListener('click', function() { setXReplyTarget(page, null) })
-
-  // 弹出键盘时把输入栏抬到键盘上方（iPhone）
-  var vv = window.visualViewport
-  if (vv && bar) {
-    var fit = function() {
-      if (!document.body.contains(page)) {
-        vv.removeEventListener('resize', fit)
-        vv.removeEventListener('scroll', fit)
-        return
-      }
-      var kb = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))
-      bar.style.transform = kb > 40 ? 'translateY(' + (-kb) + 'px)' : ''
-    }
-    vv.addEventListener('resize', fit)
-    vv.addEventListener('scroll', fit)
-  }
-}
-
-async function sendXUserComment(postId, text) {
-  var data = xForumData
-  var user = xCurrentUser
-  var post = findXPost(postId, data)
-  if (!post || !user) return
-  var profile = await getXProfile(user)
-  var c = {
-    id: xNewId('c'), kind: 'user', authorId: user.id,
-    name: getXProfileName(user, profile),
-    handle: stripXAt(getXProfileHandle(user, profile)),
-    avatar: profile.avatar || user.avatar || '',
-    content: text, ts: Date.now(), likes: 0, liked: false
-  }
-  if (xReplyTarget) {
-    c.replyTo = { id: xReplyTarget.id, name: xReplyTarget.name, handle: xReplyTarget.handle }
-  }
-  post.comments.push(c)
-  await saveXForum(data)
-  refreshXViews(data, postId)
-  var scroll = document.querySelector('#x-post-detail .x-detail-scroll')
-  if (scroll) scroll.scrollTop = scroll.scrollHeight
-}
-
-// 给用户的一条评论生成回复
-async function generateXCommentReplies(user, data, postId, commentId) {
-  if (!user || xReplyBusy[commentId]) return
-  var post = findXPost(postId, data)
-  var cmt = xFindComment(post, commentId)
-  if (!post || !cmt) return
-  xReplyBusy[commentId] = true
-  refreshXViews(data, postId)
-  try {
-    var uName = getXUserName(user)
-    var k = xRand(2, 4)
-    var target = cmt.replyTo ? xFindComment(post, cmt.replyTo.id) : null
-    var base = target || (post.kind !== 'user' ? post : null)
-
-    // 主要回应者：被回复的人；直接评论帖子时是楼主（楼主不是用户本人时）
-    var primary = null
-    if (base && base.kind !== 'user') {
-      var baseIsOp = base === post || !!base.isOp ||
-        (post.kind === 'char' && base.kind === 'char' && String(base.authorId) === String(post.authorId)) ||
-        (post.kind === 'npc' && stripXAt(base.handle) === stripXAt(post.handle))
-      primary = { kind: base.kind, charId: base.authorId, name: base.name, handle: stripXAt(base.handle), isOp: baseIsOp }
-    }
-
-    var cands = []
-    if (primary && primary.kind === 'char') {
-      var friends = await loadXFriendChars(user)
-      var found = friends.filter(function(f) { return String(f.id) === String(primary.charId) })[0]
-      if (found) cands = [found]
-      else primary.kind = 'npc'
-    }
-
-    var profile = await getXProfile(user)
-    var system =
-      '你在模拟一个中文问答社区（风格类似小红书；界面是 X 的样子）的评论区。用户「' + uName + '」（X 账号 ' + getXProfileName(user, profile) + ' @' + stripXAt(getXProfileHandle(user, profile)) + '）在下面这条帖子里发了一条评论，请写 ' + k + ' 条针对这条评论的回复。\n' +
-      '回复 20-120 字，口语、像真人，别客套，别 AI 腔，小红书式口吻适度，可带 emoji。\n\n'
-
-    if (primary && primary.kind === 'char') {
-      var ch = cands[0]
-      system +=
-        '【第一条必须是这位的回复】角色「' + ch.charName + '」（X 账号 ' + primary.name + ' @' + primary.handle + '），' +
-        (primary.isOp ? '他是这条帖子的楼主。' : '他是被回复的那条评论的作者。') +
-        '他认得出评论者就是「' + uName + '」本人（他们是好友），按人设自然回应（认真解答、调侃、暗示、点破都可以）。\n' +
-        '设定：' + ch.persona.slice(0, 500).replace(/\s+/g, ' ') + '\n' +
-        '他的回复格式：F§' + ch.id + '§回复内容\n' +
-        '其余 ' + (k - 1) + ' 条来自互不相识的路人网友（网名 2-8 字，@用户名英文数字下划线，各不相同，不认识评论者），可以补充、赞同、抬杠、追问。\n'
-    } else if (primary) {
-      system +=
-        '【第一条必须是这位的回复】网友「' + primary.name + '」@' + primary.handle + '，' +
-        (primary.isOp ? '他是这条帖子的楼主' : '他是被回复的那条评论的作者') + '，用 C 行回复，网名和用户名必须与此完全一致。\n' +
-        '其余 ' + (k - 1) + ' 条来自互不相识的路人网友（网名 2-8 字，@用户名英文数字下划线，各不相同，不认识评论者），可以补充、赞同、抬杠、追问。\n'
-    } else {
-      system += '回复者都是互不相识的路人网友（网名 2-8 字，@用户名英文数字下划线，各不相同，不认识评论者），可以补充、赞同、抬杠、追问。\n'
-    }
-    system += '\n【输出格式】不要 JSON、不要 markdown、不要解释；每条回复单独一行、内容不换行：\n' +
-      (primary && primary.kind === 'char' ? 'F§角色id§回复内容\n' : '') +
-      'C§网名§@用户名§回复内容\n'
-
-    var recent = (post.comments || []).filter(function(x) { return x.id !== cmt.id }).slice(-6)
-      .map(function(x) { return x.name + '：' + String(x.content).slice(0, 60).replace(/\s+/g, ' ') }).join('\n')
-    var userText =
-      '帖子（楼主 ' + post.name + ' @' + stripXAt(post.handle) + '）：' + post.content.slice(0, 400) + '\n' +
-      (recent ? '\n评论区节选：\n' + recent + '\n' : '') +
-      (target ? '\n被回复的评论（' + target.name + ' @' + stripXAt(target.handle) + '）：' + target.content.slice(0, 200) + '\n' : '') +
-      '\n评论者「' + cmt.name + '」的评论：' + cmt.content
-
-    var raw = await callXAI(system, userText)
-    var parsed = parseXOutput(raw, 'replies')
-    if (!parsed.loose.length) throw xFormatError('模型返回的内容无法识别为评论回复', raw)
-
-    if (primary && primary.kind === 'npc' && parsed.loose[0] && parsed.loose[0].kind === 'npc') {
-      parsed.loose[0].name = primary.name
-      parsed.loose[0].handle = primary.handle
-    }
-    var charMap = {}
-    cands.forEach(function(c) { charMap[String(c.id)] = c })
-    var accounts = ensureXAccounts(data, cands, parsed.accounts)
-    var built = buildXComments(parsed.loose, Date.now() - 1000, charMap, accounts, k + 1, 1)
-    var t0 = Date.now()
-    built.forEach(function(c, i) {
-      c.ts = t0 + i * 800
-      c.replyTo = { id: cmt.id, name: cmt.name, handle: stripXAt(cmt.handle) }
-      if (primary && primary.isOp) {
-        if (c.kind === 'char' && primary.kind === 'char' && String(c.authorId) === String(primary.charId)) c.isOp = true
-        if (c.kind === 'npc' && primary.kind === 'npc' && stripXAt(c.handle).toLowerCase() === primary.handle.toLowerCase()) c.isOp = true
-      }
-    })
-    post.comments = (post.comments || []).concat(built)
-  } catch (e) {
-    console.warn('[x-page] 评论回复生成失败：', e)
-    xShowError('回复生成失败', e)
-  } finally {
-    delete xReplyBusy[commentId]
-    await saveXForum(data)
-    refreshXViews(data, postId)
-  }
-}
-
-/* ============================================================
-   点角色头像：修改该角色的 X 昵称 / 用户名
-   ============================================================ */
-function showXAccountEdit(charId) {
-  var data = xForumData
-  if (!data) return
-  var key = String(charId)
-  var acc = data.accounts[key]
-  if (!acc) { xToast('该角色还没有 X 账号'); return }
-  var mask = xOpenSheet({
-    title: '修改角色的 X 账号',
-    bodyHTML:
-      '<div class="x-sheet-form">' +
-        '<label>昵称<input class="x-sheet-input" id="x-acc-name" maxlength="14" value="' + xEscape(acc.name) + '"></label>' +
-        '<label>用户名<input class="x-sheet-input" id="x-acc-handle" maxlength="15" autocapitalize="off" autocorrect="off" spellcheck="false" value="' + xEscape(acc.handle) + '"></label>' +
-        '<div class="x-sheet-hint">用户名只能用英文、数字、下划线。保存后，该角色的旧帖子和评论会一起更新。</div>' +
-      '</div>',
-    items: [{
-      label: '保存', icon: 'fa-solid fa-check',
-      onClick: function() {
-        var name = xCleanName(mask.querySelector('#x-acc-name').value, acc.name)
-        var handle = stripXAt(mask.querySelector('#x-acc-handle').value).replace(/[^A-Za-z0-9_]/g, '').slice(0, 15) || acc.handle
-        data.accounts[key] = { name: name, handle: handle }
-        data.posts.forEach(function(p) {
-          if (p.kind === 'char' && String(p.authorId) === key) { p.name = name; p.handle = handle }
-          ;(p.comments || []).forEach(function(c) {
-            if (c.kind === 'char' && String(c.authorId) === key) { c.name = name; c.handle = handle }
-          })
-          ;(p.comments || []).forEach(function(c) {
-            if (!c.replyTo) return
-            var t = xFindComment(p, c.replyTo.id)
-            if (t && t.kind === 'char' && String(t.authorId) === key) { c.replyTo.name = name; c.replyTo.handle = handle }
-          })
-        })
-        saveXForum(data)
-        refreshXViews(data)
-        xToast('已保存')
-      }
-    }]
-  })
-  mask.classList.add('x-sheet-top')
 }
 
 /* ============================================================
@@ -1276,23 +976,20 @@ async function runXCharPosts(user, picked) {
 }
 
 async function generateXCharPost(user, data, ch) {
-  var n = xRand(6, 10)
-  var isAsk = Math.random() < 0.7
+  var n = xRand(8, 12)
   var userName = getXUserName(user)
   var acc = data.accounts[String(ch.id)]
   var recent = await loadXRecentChat(user, ch.id, 10, 700)
 
   var system =
-    '你正在扮演角色「' + ch.charName + '」，在一个中文问答社区（风格类似小红书：提问求助 + 经验分享；界面是 X 的样子）上发帖。\n\n' +
+    '你正在扮演角色「' + ch.charName + '」，在公开社交平台 X（推特）上发帖。\n\n' +
     '【角色设定】\n' + (ch.persona.slice(0, 1800) || '（暂无额外设定）') +
     (ch.role ? '\n身份：' + ch.role : '') + '\n\n' +
     '【任务】\n' +
-    (isAsk
-      ? '1. 以你自己的账号发 1 条「提问求助帖」（50-200 字）：结合你的人设、身份和最近的生活，提一个你真会遇到的具体问题（生活、工作学习、情感、消费、兴趣都可以），交代背景和已经尝试过的，最后明确问一句求解答。口吻完全符合你的人设。'
-      : '1. 以你自己的账号发 1 条「经验分享帖」（60-200 字）：结合你的人设和最近的生活，分享一个真实的小经验、心得、踩坑或安利，有细节。口吻完全符合你的人设。') +
+    '1. 以你自己的 X 账号发 1 条帖子（20-120 字），内容自然：日常、心情、吐槽、碎碎念、对最近发生的事的感想都可以，口吻完全符合你的人设。' +
     '这是公开平台，读者大多是不认识你的网友：不要写私密对话的细节，不要公开「' + userName + '」的真名和隐私（想暗戳戳地提也可以）。\n' +
-    '2. 然后模拟帖子发出后评论区的 ' + n + ' 条路人网友评论：互不相识，网名（2-8 字）和 @用户名（英文数字下划线）各不相同，评论 20-150 字，长短不一。' +
-    xCommentStyle(isAsk ? 'ask' : 'share') + '路人不知道你的现实身份。\n\n' +
+    '2. 然后模拟帖子发出后评论区的 ' + n + ' 条路人网友评论：互不相识，网名（2-8 字）和 @用户名（英文数字下划线）各不相同，' +
+    '语气各异（赞同、玩梗、抬杠、提问、跑题、水评、偶尔小广告），5-60 字，不要 AI 腔。路人不知道你的现实身份。\n\n' +
     (acc
       ? '你的 X 账号是「' + acc.name + '」@' + acc.handle + '，保持不变。\n'
       : '你还没有 X 账号：请先取一个符合人设的网名和 @用户名，在输出第一行写：A§' + ch.id + '§网名§@用户名\n') +
@@ -1363,29 +1060,18 @@ async function runXNpcPosts() {
 }
 
 async function generateXNpcPosts(data) {
-  var n = xRand(4, 6)
-  var shuffle = function() { return Math.random() - 0.5 }
-  var askPool = X_TOPICS_ASK.slice().sort(shuffle)
-  var sharePool = X_TOPICS_SHARE.slice().sort(shuffle)
-  var kinds = []
-  var topics = []
+  var n = xRand(4, 8)
+  var topics = X_TOPICS.slice().sort(function() { return Math.random() - 0.5 }).slice(0, n)
   var counts = []
-  for (var i = 0; i < n; i++) {
-    var ask = Math.random() < 0.75
-    kinds.push(ask ? '提问求助' : '经验分享')
-    var pool = ask ? askPool : sharePool
-    topics.push(pool.length ? pool.pop() : '日常生活')
-    counts.push(xRand(3, 6))
-  }
+  for (var i = 0; i < n; i++) counts.push(xRand(4, 8))
 
   var system =
-    '你在模拟一个中文问答社区（风格类似小红书：大家发帖提问、求助、分享经验，评论区热心回答；界面是 X 的样子）。请生成 ' + n + ' 条互不相关的普通网友帖子，并为每条帖子写评论区的评论。\n\n' +
-    '【帖子类型与主题】每条各用一个，对应如下：\n' +
-    topics.map(function(t, i) { return '帖子' + (i + 1) + '：' + kinds[i] + '｜主题：' + t }).join('\n') + '\n\n' +
-    '【帖子要求】提问帖 50-200 字：交代背景、遇到的具体问题、已经试过什么，最后明确问一句求解答；分享帖 60-200 字：讲清经历和心得，有细节。' +
-    '发帖人的网名（2-8 字）和 @用户名（英文数字下划线）各不相同，身份各异（学生、打工人、宝妈、程序员、考研党、游戏玩家、外卖骑手等，自行安排）。' +
-    '口语化，有真实生活质感，像真人随手发的，不要 AI 腔，不要全是正能量，可以有口癖、emoji 和少量错别字。\n' +
-    '【评论要求】评论 20-150 字，长短不一，网友之间互不相识。' + xCommentStyle() + '\n' +
+    '你在模拟大型中文社交平台 X（推特）。请生成 ' + n + ' 条互不相关的普通网友发的帖子，并为每条帖子写评论区的评论。\n\n' +
+    '【帖子主题】每条各用一个，对应如下：\n' +
+    topics.map(function(t, i) { return '帖子' + (i + 1) + '：' + t }).join('\n') + '\n\n' +
+    '【要求】发帖人的网名（2-8 字）和 @用户名（英文数字下划线）各不相同，身份各异（学生、打工人、宝妈、程序员、考研党、游戏玩家、外卖骑手等，自行安排）。' +
+    '帖子 15-140 字，口语化，有真实生活质感，像真人随手发的，不要 AI 腔，不要全是正能量，可以有口癖和错别字。' +
+    '评论 5-60 字，语气各异（赞同、玩梗、抬杠、追问、共鸣、跑题、水评），网友之间互不相识，不要客套。\n' +
     '各帖评论条数：' + counts.map(function(c, i) { return '帖子' + (i + 1) + ' ' + c + ' 条' }).join('；') + '\n\n' +
     '【输出格式】不要 JSON、不要 markdown、不要解释；每条内容单行（需要换行时写 \\n）。每个帖子先一行 P，再跟它的评论 C 行：\n' +
     'P§网名§@用户名§帖子正文\n' +
