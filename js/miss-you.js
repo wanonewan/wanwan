@@ -250,6 +250,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       statusRegex,
       statusDesc,
       statusFields,
+      proseGuard: raw.proseGuard !== false,
       beautyPresetId: raw.beautyPresetId ? String(raw.beautyPresetId) : '',
       userSubtitle: raw.userSubtitle === undefined || raw.userSubtitle === null
         ? MISS_USER_SUBTITLE_DEFAULT
@@ -1493,6 +1494,17 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const raw = await window.callAI(timeline, { system, temperature: await window.getAITemperaturePreset('offlineMode') })
     const reply = cleanOfflineReply(raw)
     if (!reply) throw new Error('AI 返回了空响应，请检查 API 配置或稍后重试')
+    // 套话句式润色：状态栏和对白原样保留，只改命中的叙述行；失败就用原文
+    if (settings.proseGuard !== false && window.ProseGuard) {
+      try {
+        const r = await window.ProseGuard.polishText(reply, {
+          allow: 1,
+          maxUnits: 6,
+          protect: [buildStatusRE(settings), /<status>[\s\S]*?<\/status>/i]
+        })
+        if (r.fixed) return r.text
+      } catch (e) { console.warn('[miss-you] 润色失败，使用原文', e) }
+    }
     return reply
   }
 
@@ -1547,6 +1559,9 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const memoryBlock = buildOfflineMemoryBlock(memoryCtx)
     const antiRepeatBlock = buildAntiRepeatBlock(offlineAll)
     const narrativeRule = buildNarrativePersonRule(settings.narrativePerson, charName, userName)
+    const proseRule = (settings.proseGuard !== false && window.ProseGuard)
+      ? window.ProseGuard.styleRule({ prefix: '- ', unit: '一条回复', max: 1 })
+      : ''
     let scheduleRule = ''
     try {
       const helpers0 = window._wechatCallHelpers || {}
@@ -1614,7 +1629,7 @@ ${ttsTagRule}${scheduleRule}- 必须同时包含动作描写、神态描写和�
 ## 禁止
 - 禁止微信表情包、图片、语音、红包、转账、朋友圈、聊天气泡等网络元素。
 - 禁止重复已出现过的动作、台词、描写、场景和句式；避免让回复像之前内容的改写。
-- 除开头固定<status>结构外，禁止输出 JSON、Markdown、标题、解释、方括号前缀或元标记，如[微信消息]、[线下]、[旁白]、[系统]、[动作]。`
+- 除开头固定<status>结构外，禁止输出 JSON、Markdown、标题、解释、方括号前缀或元标记，如[微信消息]、[线下]、[旁白]、[系统]、[动作]。${proseRule ? '\n' + proseRule : ''}`
   }
 
   function buildNarrativePersonRule(narrativePerson, charName, userName) {
@@ -1801,6 +1816,15 @@ ${memoryCtx}`
         </div>
 
         <div class="cs-section">
+          <div class="cs-section-label">文风</div>
+          <div class="cs-section-sub">改掉“不是…而是…”“怎么…怎么…”这类套话句式。只有检测到时才多调用一次 AI，只改命中的那几行</div>
+          <label class="miss-field-label" style="display:flex;flex-direction:row;align-items:center;gap:8px">
+            <input type="checkbox" id="miss-prose-guard" ${settings.proseGuard !== false ? 'checked' : ''}>
+            <span>自动润色套话句式</span>
+          </label>
+        </div>
+
+        <div class="cs-section">
           <div class="cs-section-label">页面美化</div>
           <div class="cs-section-sub">仅应用到当前 live 见面页面，不影响历史记录和其他页面</div>
           <label class="miss-field-label">
@@ -1869,6 +1893,7 @@ ${memoryCtx}`
       const userSubtitle = page.querySelector('#miss-user-subtitle').value
       const charSubtitle = page.querySelector('#miss-char-subtitle').value
       const beautyPresetId = page.querySelector('input[name="miss-beauty-preset"]:checked')?.value || ''
+      const proseGuard = !!page.querySelector('#miss-prose-guard')?.checked
       await saveOfflineSettings(ownerUid, chat.id, mode, {
         minWords,
         maxWords,
@@ -1879,7 +1904,8 @@ ${memoryCtx}`
         statusDesc,
         userSubtitle,
         charSubtitle,
-        beautyPresetId
+        beautyPresetId,
+        proseGuard
       })
       await refreshOfflineChat(chatPage)
       await applyMissBeauty(chatPage, ownerUid, chat.id, mode)

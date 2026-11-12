@@ -611,6 +611,27 @@
     }
   }
 
+  // 文风规则（提示词）与套话句式润色（生成后），都依赖共用的 prose-guard.js；没加载或关掉时自动跳过
+  function icityProseRule(kind) {
+    const pg = window.ProseGuard
+    if (!pg || !pg.isEnabled('icity')) return ''
+    return kind === 'note'
+      ? pg.styleRule({ prefix: '· ', short: true }) + '\n'
+      : pg.styleRule({ prefix: '· ', unit: '整篇日记', max: 2 }) + '\n'
+  }
+
+  async function icityPolish(text, kind) {
+    const pg = window.ProseGuard
+    if (!pg || !pg.isEnabled('icity') || !text) return text
+    try {
+      const r = await pg.polishText(text, { allow: kind === 'note' ? 0 : 1, maxUnits: 8 })
+      return r.fixed ? r.text : text
+    } catch (e) {
+      console.warn('[icity] 润色失败，使用原文', e)
+      return text
+    }
+  }
+
   function buildICityPrompt(ctx) {
     const systemPrompt = `现在你就是「${ctx.friendName}」这个人${ctx.charRole ? `，${ctx.charRole}` : ''}。这是你的设定：
 ${ctx.persona || '暂无额外设定。'}
@@ -622,7 +643,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
 · 不要写得像作文，不用讲究开头结尾和结构。就是随手记，记今天的心情和发生的小事。
 · 多写具体的感受，少原样记叙发生了什么。比如：今天吃了什么、出门看到了什么、和谁说了什么话这些事件类概括写，占10%，自己之后回看明白在说什么即可。由此心里想到什么要多写。不要只写空泛的感受。应当有独特性和实效性，可以令人明确感知到个人特质和具体某天的所思所想，在回看时能够通过感受回到那一天为符合要求。
 · 字数 500 到 3000 字之间。想多写就多写，想少写就少写，不用硬凑字数。
-· 不要在日记里写日期、星期、标题、或者「第几天」这种字。时间由系统单独记，你只写日记内容就行。
+${icityProseRule('diary')}· 不要在日记里写日期、星期、标题、或者「第几天」这种字。时间由系统单独记，你只写日记内容就行。
 · 不要输出任何双花括号包裹的模板占位符。
 · 直接输出日记正文，纯文本。不要标题，不要代码块，不要在日记前后加任何说明或总结。`
 
@@ -647,7 +668,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
 · 像朋友间随手回话，自然、简短，一般 1 到 3 句，不要写成长篇大论。
 · 一定要针对对方那条小纸条的具体内容回应，先认真读懂对方说了什么，再回答。
 · 小纸条对话里你已经说过的话不要重复，也不要换个说法再说一遍同样的意思，要顺着对话往下推进。
-· 不要输出任何双花括号包裹的模板占位符。`
+${icityProseRule('note')}· 不要输出任何双花括号包裹的模板占位符。`
 
     const authorLine = ctx.isUserPost
       ? `这是${ctx.userName}写的日记：`
@@ -908,7 +929,7 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
         [{ role: 'user', content: prompt.userPrompt }],
         { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
       )
-            const newPost = applyICityDiary(ctx, cleanICityDiaryText(raw))
+            const newPost = applyICityDiary(ctx, await icityPolish(cleanICityDiaryText(raw), 'diary'))
       window.LoveDiary?.afterDiaryGenerated({ ownerUid: ctx.ownerUid, charId: ctx.friendId, diaryText: newPost.text, createdAt: newPost.createdAt })
       pending?.remove()
       await renderICityHome(page)
@@ -966,7 +987,9 @@ ${ctx.loreText ? `\n这是和你相关的背景设定（世界书），请把它
         [{ role: 'user', content: prompt.userPrompt }],
         { system: prompt.systemPrompt, temperature: await window.getAITemperaturePreset('icityDiary') }
       )
-      const { updated, count } = applyICityNoteResults(ctx, parseICityNoteLines(raw))
+      const entries = parseICityNoteLines(raw)
+      await Promise.all(entries.map(async en => { en.comment = await icityPolish(en.comment, 'note') }))
+      const { updated, count } = applyICityNoteResults(ctx, entries)
       if (!count) {
         const err = new Error('没有从模型的返回里读到可用的回复')
         err.rawOutput = raw

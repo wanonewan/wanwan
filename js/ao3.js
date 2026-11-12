@@ -346,6 +346,11 @@
   // 只把命中的段落发给 AI 改写，其余原样不动。第一轮 6 段一批；没改成的再单独加强重试一轮。
   // 改写不合格（改了台词、长度不对、句式没减少）就保留原文，并返回失败原因
   async function polishBody(body) {
+    // 优先用共用的 prose-guard（能检出跨段落的句式）；没加载时用下面的旧逻辑
+    if (window.ProseGuard && typeof window.callAI === 'function') {
+      const r = await window.ProseGuard.polishText(normalizeBody(body), { allow: 1, maxUnits: 12 })
+      return { body: r.text, fixed: r.fixed, failed: r.failed }
+    }
     const paras = normalizeBody(body).split(/\n{2,}/)
     const flagged = flagParas(paras).slice(0, 12)
     if (!flagged.length || typeof window.callAI !== 'function') return { body: paras.join('\n\n'), fixed: 0, failed: [] }
@@ -1485,7 +1490,7 @@
     if (busy || w.continuing) { window.toast?.('正在生成，请稍候'); return }
     if (typeof window.callAI !== 'function') { window.toast?.('请先在设置里配置 API'); return }
     const chaps = w.chapters || []
-    const plan = chaps.map(c => flagParas(normalizeBody(c.body).split(/\n{2,}/)).length)
+    const plan = chaps.map(c => window.ProseGuard ? window.ProseGuard.count(normalizeBody(c.body), { allow: 1 }) : flagParas(normalizeBody(c.body).split(/\n{2,}/)).length)
     const paraTotal = plan.reduce((a, b) => a + Math.min(b, 12), 0)
     if (!paraTotal) { window.toast?.('检查完毕，没有发现需要修改的套话句式'); return }
     const calls = plan.reduce((a, b) => a + Math.ceil(Math.min(b, 12) / 6), 0)
