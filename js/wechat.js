@@ -21117,6 +21117,8 @@ let _callTTSRetryTimer = null
 let _callTTSRequestSeq = 0
 let _callTTSCanceledRetrySeqs = new Set()
 let _callAISending = false
+let _callSessionId = 0 // 每次通话结束 +1，用来作废挂断前遗留的旧请求
+const CALL_AI_TIMEOUT_MS = 45 * 1000
 let _callInitiator = 'user'
 let _realCameraStream = null
 let _realCameraActive = false
@@ -21770,7 +21772,7 @@ function bindCallEvents(page, type) {
 }
 
 function handleCallUserSend(page) {
-  if (_callState !== 'connected') return
+  if (_callState === 'idle') return
   const input = page.querySelector('#call-input')
   const text = input.value.trim()
   if (!text) return
@@ -21789,7 +21791,7 @@ function handleCallUserSend(page) {
 }
 
 async function handleCallReply(page) {
-  if (_callState !== 'connected' || _callAISending) return
+  if (_callState === 'idle' || _callAISending) return
   if (_callHistory.length === 0 || _callHistory[_callHistory.length - 1].role !== 'user') {
     window.toast?.('请先发送消息')
     return
@@ -21845,7 +21847,39 @@ function removeCallTypingIndicator(el) {
 }
 
 
+function callAIWithTimeout(messages, opts) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('对方响应超时（' + Math.round(CALL_AI_TIMEOUT_MS / 1000) + ' 秒）')), CALL_AI_TIMEOUT_MS)
+    window.callAI(messages, opts).then(
+      v => { clearTimeout(timer); resolve(v) },
+      e => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
+function clearCallRetryStatus(page) {
+  const el = page.querySelector('#call-status')
+  if (!el) return
+  el.onclick = null
+  el.style.cursor = ''
+  el.style.textDecoration = ''
+}
+
+function showCallRetryStatus(page) {
+  const el = page.querySelector('#call-status')
+  if (!el) return
+  el.textContent = '对方没有响应，点这里重试'
+  el.style.cursor = 'pointer'
+  el.style.textDecoration = 'underline'
+  el.onclick = () => {
+    if (_callState !== 'connecting') { clearCallRetryStatus(page); return }
+    if (_callAISending) return
+    sendCallAIRequest(page)
+  }
+}
+
 async function sendCallAIRequest(page) {
+  const mySession = _callSessionId
   if (_callAISending) return
   _callAISending = true
 
@@ -21854,7 +21888,8 @@ async function sendCallAIRequest(page) {
   let typingEl = null
   try {
     if (_callState === 'connecting') {
-      updateCallStatus(page, '正在等待接听...')
+      clearCallRetryStatus(page)
+      updateCallStatus(page, '对方正在接听...')
     }
 
     let messages = _callHistory.map(m => ({ role: m.role, content: m.content }))
@@ -21882,7 +21917,7 @@ async function sendCallAIRequest(page) {
       }
     }
     typingEl = showCallTypingIndicator(page)
-    const raw = await window.callAI(messages, {
+    const raw = await callAIWithTimeout(messages, {
       system: _callSystemPrompt,
       responseFormat: 'json_object',
       responseJsonSchema: CALL_AI_JSON_SCHEMA,
@@ -21892,6 +21927,7 @@ async function sendCallAIRequest(page) {
     typingEl = null
     if (_callState === 'idle') return
 
+    if (mySession !== _callSessionId) return // 旧通话遗留的请求，直接丢弃
     const parsed = extractCallJson(raw)
     if (window.ProseGuard && window.ProseGuard.isEnabled('wechat') && parsed.speech) {
       try {
@@ -21925,13 +21961,14 @@ async function sendCallAIRequest(page) {
 
   } catch (e) {
     console.error('通话 AI 请求失败', e)
+    if (mySession !== _callSessionId || _callState === 'idle') return
     if (_callState === 'connecting') {
-      updateCallStatus(page, '连接失败')
+      showCallRetryStatus(page)
     }
     window.toast?.('通话出错：' + (e.message || '').slice(0, 100))
   } finally {
-        removeCallTypingIndicator(typingEl)
-    _callAISending = false
+    removeCallTypingIndicator(typingEl)
+    if (mySession === _callSessionId) _callAISending = false
   }
 }
 
@@ -22659,6 +22696,7 @@ async function endCall(opts = {}) {
 }
 
 function resetCallState() {
+  _callSessionId++
   stopCallIdleWatch()
   _callLastActivity = 0
   _callResumeRecordId = null
