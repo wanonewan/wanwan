@@ -21672,7 +21672,7 @@ async function startCall(chatId, charId, type, initiator = 'user') {
 
   window.openPage(page)
   bindCallEvents(page, type)
-
+  try {
     const bootSession = _callSessionId
     _callSystemPrompt = ''
     showCallTypingIndicator(page) // 拨出后立刻出现三点，表示正在等对方
