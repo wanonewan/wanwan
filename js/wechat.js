@@ -9224,6 +9224,13 @@ async function renderEmojiPanel(chatPage) {
         if (btn.dataset.sending === '1') return
         const sticker = stickers.find(x => x.id === parseInt(btn.dataset.id))
         if (!sticker) return
+        // 第一次点击只选中（下方出现红栏「确认发送」），再点一次才真正发送，避免滑动误触
+        if (!btn.classList.contains('sp-armed')) {
+          gridEl.querySelectorAll('.sp-tile.sp-armed').forEach(t => t.classList.remove('sp-armed'))
+          btn.classList.add('sp-armed')
+          return
+        }
+        btn.classList.remove('sp-armed')
         btn.dataset.sending = '1'
         btn.disabled = true
         try {
@@ -19098,6 +19105,18 @@ async function renderStickerGrid(container, catId, page) {
       e.preventDefault()
       e.stopPropagation()
     }, true)
+    // 排序模式：点选 → 再点目标，把选中的插到目标前面
+    tile.addEventListener('click', async e => {
+      if (e.defaultPrevented || !page?.classList.contains('sl-sorting')) return
+      const pickedId = page._slPickId
+      if (!pickedId) { page._slPickId = tile.dataset.id; tile.classList.add('sl-picked'); return }
+      const picked = container.querySelector(`.sl-tile[data-id="${pickedId}"]`)
+      page._slPickId = null
+      container.querySelectorAll('.sl-tile.sl-picked').forEach(t => t.classList.remove('sl-picked'))
+      if (!picked || picked === tile) return
+      tile.parentElement.insertBefore(picked, tile)
+      try { await persistStickerOrder(container) } catch (err) { window.toast('排序保存失败，请重试') }
+    })
   })
 }
 
@@ -19141,6 +19160,9 @@ function showCategoryMenu(catId, anchorEl, page) {
   menu.id = 'msg-menu'
   menu.className = 'msg-context-menu'
   menu.innerHTML = `
+    <button data-action="left"><i class="fa fa-arrow-left"></i> 向前移一位</button>
+    <button data-action="right"><i class="fa fa-arrow-right"></i> 向后移一位</button>
+    <button data-action="front"><i class="fa fa-arrow-up"></i> 移到最前</button>
     <button data-action="rename"><i class="fa fa-pencil"></i> 重命名</button>
     <button data-action="delete"><i class="fa fa-trash"></i> 删除分组</button>
   `
@@ -19151,6 +19173,9 @@ function showCategoryMenu(catId, anchorEl, page) {
       menu.remove()
       const action = btn.dataset.action
       if (action === 'rename') promptRenameStickerCategory(catId, page)
+      if (action === 'left' || action === 'right' || action === 'front') {
+        try { await moveStickerCategory(catId, action, page) } catch (e) { window.toast('操作失败，请重试') }
+      }
       if (action === 'delete') confirmDeleteStickerCategory(catId, page)
     })
   })
@@ -19227,6 +19252,7 @@ function showStickerMenu(stickerId, anchorEl, page) {
   menu.id = 'msg-menu'
   menu.className = 'msg-context-menu'
   menu.innerHTML = `
+    <button data-action="front"><i class="fa fa-arrow-up"></i> 移到最前</button>
     <button data-action="rename"><i class="fa fa-pencil"></i> 重命名</button>
     <button data-action="move"><i class="fa fa-folder-open"></i> 移动到</button>
     <button data-action="delete"><i class="fa fa-trash"></i> 删除</button>
@@ -19239,6 +19265,18 @@ function showStickerMenu(stickerId, anchorEl, page) {
       const action = btn.dataset.action
       if (action === 'rename') promptRenameSticker(stickerId, page)
       if (action === 'move') promptMoveSticker(stickerId, page)
+      if (action === 'front') {
+        try {
+          const key = await moveStickerToFront(stickerId)
+          const contentEl = page?.querySelector('#sl-content')
+          const tile = page?.querySelector(`.sl-tile[data-id="${stickerId}"]`)
+          if (tile?.parentElement) tile.parentElement.insertBefore(tile, tile.parentElement.firstElementChild)
+          if (contentEl?._slKeys) contentEl._slKeys[stickerId] = key
+          window.toast('已移到最前')
+        } catch (e) {
+          window.toast('操作失败，请重试')
+        }
+      }
       if (action === 'delete') {
         try {
           await db.stickers.delete(stickerId)
@@ -19326,7 +19364,8 @@ function promptMoveSticker(stickerId, page) {
       const newCatId = parseInt(checked.value)
       if (newCatId === s.categoryId) { closeWcSheet(sheet); return }
       try {
-        await db.stickers.update(stickerId, { categoryId: newCatId })
+        const frontStart = await getStickerFrontStart(newCatId, 1)
+        await db.stickers.update(stickerId, { categoryId: newCatId, sortOrder: frontStart })
       } catch (e) {
         window.toast('移动失败，请刷新页面重试')
         return
@@ -19449,11 +19488,14 @@ function bindStickerImportDialog(sheet, onDone) {
     }
     const catId = parseInt(sheet.querySelector('#si-cat-select').value)
     const now = Date.now()
+    // 新导入的表情排在该分组最前面（同一批保持导入顺序）
+    const frontStart = await getStickerFrontStart(catId, pendingItems.length)
     await db.stickers.bulkAdd(pendingItems.map((it, i) => ({
       categoryId: catId,
       name: String(it.name || '').trim().slice(0, 20),
       image: it.image,
-      createdAt: now + i
+      createdAt: now + i,
+      sortOrder: frontStart + i
     })))
     closeWcSheet(sheet)
     window.toast(`已导入 ${pendingItems.length} 个表情包`)
