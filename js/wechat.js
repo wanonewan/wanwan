@@ -21673,10 +21673,17 @@ async function startCall(chatId, charId, type, initiator = 'user') {
   window.openPage(page)
   bindCallEvents(page, type)
 
-  try {
-    _callSystemPrompt = type === 'video'
-      ? await buildVideoCallSystemPrompt(chatId, charId)
-      : await buildVoiceCallSystemPrompt(chatId, charId)
+    const bootSession = _callSessionId
+    _callSystemPrompt = ''
+    showCallTypingIndicator(page) // 拨出后立刻出现三点，表示正在等对方
+    updateCallStatus(page, '对方正在接听...')
+    _callSystemPrompt = await withCallTimeout(
+      type === 'video'
+        ? buildVideoCallSystemPrompt(chatId, charId)
+        : buildVoiceCallSystemPrompt(chatId, charId),
+      20000, '准备通话资料超时'
+    )
+    if (bootSession !== _callSessionId) return // 已挂断，不再继续
 
     const userName = window._wechatUser?.name || '用户'
     const helpers = h()
@@ -21696,7 +21703,8 @@ async function startCall(chatId, charId, type, initiator = 'user') {
     dispatchCallStateChange()
     await sendCallAIRequest(page)
   } catch (e) {
-    console.error('通话连接失败', e)
+console.error('通话连接失败', e)
+    page.querySelectorAll('.call-msg-typing').forEach(el => el.remove())
     updateCallStatus(page, '连接失败')
     window.toast?.('通话连接失败：' + (e.message || '未知错误'))
   }
@@ -21847,6 +21855,16 @@ function removeCallTypingIndicator(el) {
 }
 
 
+function withCallTimeout(promise, ms, msg) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(msg)), ms)
+    Promise.resolve(promise).then(
+      v => { clearTimeout(timer); resolve(v) },
+      e => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
 function callAIWithTimeout(messages, opts) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('对方响应超时（' + Math.round(CALL_AI_TIMEOUT_MS / 1000) + ' 秒）')), CALL_AI_TIMEOUT_MS)
@@ -21880,6 +21898,7 @@ function showCallRetryStatus(page) {
 
 async function sendCallAIRequest(page) {
   const mySession = _callSessionId
+  if (!_callSystemPrompt) { window.toast?.('通话资料还在准备中，请稍候'); return }
   if (_callAISending) return
   _callAISending = true
 
@@ -21916,7 +21935,7 @@ async function sendCallAIRequest(page) {
         }
       }
     }
-    typingEl = showCallTypingIndicator(page)
+  typingEl = page.querySelector('.call-msg-typing') || showCallTypingIndicator(page)
     const raw = await callAIWithTimeout(messages, {
       system: _callSystemPrompt,
       responseFormat: 'json_object',
