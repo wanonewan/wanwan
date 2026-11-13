@@ -6203,6 +6203,13 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       await applyCharScheduleFromReply(chatId, charId, _aiResult)
       await applyShopApprovalFromReply(chatId, _aiResult)
       _activeReplyFailCount.delete(chatId)
+      // 套话句式润色（文风守卫）：特殊消息行 [xx的语音：…] 等原样保留，只改命中的普通文字行，失败就用原文
+      if (window.ProseGuard && window.ProseGuard.isEnabled('wechat') && typeof reply === 'string') {
+        try {
+          const pg = await window.ProseGuard.polishText(reply, { allow: 1, maxUnits: 4, protect: [/^\[[^\n]*\]$/m] })
+          if (pg.fixed) reply = pg.text
+        } catch (e) { console.warn('[wechat] 文风润色失败，使用原文', e) }
+      }
       const lines = splitMessageLines(reply)
       const base = Date.now()
       for (let i = 0; i < lines.length; i++) {
@@ -8388,6 +8395,7 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
   const ttsTagHintChat = await getTTSTagHint('chat', charName)
   if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
+  if (window.ProseGuard && window.ProseGuard.isEnabled('wechat')) system += '\n\n# 【文风】\n' + window.ProseGuard.styleRule({ short: true, prefix: '- ' })
   const scheduleCtxChat = await getScheduleContext()
   if (scheduleCtxChat) system += '\n\n' + scheduleCtxChat
   const charSchedChat = await getCharScheduleContext(chatId, charName)
@@ -19779,12 +19787,92 @@ function prepareTTSText(text, provider) {
   return s.replace(/【[^】\n]{0,30}】/g, '').replace(/[ \t]{2,}/g, ' ').trim()
 }
 
-// 统一入口：按当前语音服务生成语音，返回 blob 地址
+// ===== 语音持久缓存 =====
+// 以前同一句话每次打开都要重新向 Fish/Minimax 请求（通话记录里的朗读只在“本次打开期间”缓存在内存里）。
+// 现在统一在 callTTS 里按“语音服务 + 音色 + 文字”缓存到浏览器自己的一个小数据库（独立于聊天数据库，
+// 不会进聊天备份、不改表结构），最多留最近 300 句，满了删最旧的。
+// 通话里实时朗读的每一句也会存进来，所以之后在通话记录里点朗读是直接播放，不再重新生成。
+const TTS_CACHE_DB = 'wanwan_tts_cache'
+const TTS_CACHE_STORE = 'audio'
+const TTS_CACHE_MAX = 300
+let _ttsCacheDbPromise = null
+
+function ttsCacheOpen() {
+  if (_ttsCacheDbPromise) return _ttsCacheDbPromise
+  _ttsCacheDbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open(TTS_CACHE_DB, 1)
+      req.onupgradeneeded = () => {
+        const s = req.result.createObjectStore(TTS_CACHE_STORE, { keyPath: 'key' })
+        s.createIndex('at', 'at')
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => resolve(null)
+      req.onblocked = () => resolve(null)
+    } catch (_) { resolve(null) }
+  })
+  return _ttsCacheDbPromise
+}
+
+function ttsCacheKey(provider, voiceId, text) { return provider + '|' + voiceId + '|' + text }
+
+async function ttsCacheGet(key) {
+  const d = await ttsCacheOpen()
+  if (!d) return null
+  return new Promise(resolve => {
+    try {
+      const rq = d.transaction(TTS_CACHE_STORE).objectStore(TTS_CACHE_STORE).get(key)
+      rq.onsuccess = () => resolve((rq.result && rq.result.blob) || null)
+      rq.onerror = () => resolve(null)
+    } catch (_) { resolve(null) }
+  })
+}
+
+async function ttsCachePut(key, blob) {
+  const d = await ttsCacheOpen()
+  if (!d) return
+  try {
+    await new Promise(resolve => {
+      const tx = d.transaction(TTS_CACHE_STORE, 'readwrite')
+      tx.objectStore(TTS_CACHE_STORE).put({ key, blob, at: Date.now() })
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+      tx.onabort = resolve
+    })
+    await new Promise(resolve => {
+      const tx = d.transaction(TTS_CACHE_STORE, 'readwrite')
+      const st = tx.objectStore(TTS_CACHE_STORE)
+      const cr = st.count()
+      cr.onsuccess = () => {
+        let over = cr.result - TTS_CACHE_MAX
+        if (over <= 0) return
+        const cur = st.index('at').openCursor()
+        cur.onsuccess = () => {
+          const c = cur.result
+          if (c && over-- > 0) { c.delete(); c.continue() }
+        }
+      }
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+      tx.onabort = resolve
+    })
+  } catch (_) {}
+}
+
+// 统一入口：按当前语音服务生成语音，返回 blob 地址（先查本地缓存，没有才请求）
 async function callTTS(text, voiceId) {
   const provider = await getTTSProvider()
   const prepared = prepareTTSText(text, provider)
   if (!prepared) throw new Error('没有可朗读的文字')
-  return provider === 'fish' ? callFishTTS(prepared, voiceId) : callMinimaxTTS(prepared, voiceId)
+  const key = ttsCacheKey(provider, voiceId, prepared)
+  const hit = await ttsCacheGet(key)
+  if (hit && hit.size) return URL.createObjectURL(hit)
+  const url = provider === 'fish' ? await callFishTTS(prepared, voiceId) : await callMinimaxTTS(prepared, voiceId)
+  try {
+    const blob = await (await fetch(url)).blob()
+    if (blob.size) ttsCachePut(key, blob)
+  } catch (_) {}
+  return url
 }
 
 // 让角色在语音文字里写语气标签的提示词；只有当前语音服务是 Fish 时才加
@@ -19898,6 +19986,46 @@ async function getCharScheduleContext(chatId, charName) {
   } catch (e) { return '' }
 }
 
+// 主动回复“抽状态”的额外几项（概率都在这里，想调就改数字）
+const IMPULSE_P = {
+  dream: 0.5,       // 今天第一条消息：做梦并描述梦境
+  wantMedia: 0.8,   // 起性欲想要时：发自拍 / 语音
+  wantAsk: 0.3,     // 起性欲想要时：要求对方描述身体与着装状态
+  askPhoto: 2 / 3   // 上面那 30% 里：再附加要求对方拍照
+}
+const IMPULSE_PHOTO_KINDS = ['自拍', '对镜拍（能看到身上穿着）', '拍内裤', '拍大腿', '拍锁骨和肩颈', '拍腰腹']
+
+function buildImpulseExtras(pick, recent, hour) {
+  const parts = []
+  // 一天从凌晨 5 点算起；最后一条消息在今天之前，说明今天还没聊过
+  const d = new Date()
+  if (d.getHours() < 5) d.setDate(d.getDate() - 1)
+  d.setHours(5, 0, 0, 0)
+  const lastTs = Number(recent && recent[0] && recent[0].createdAt) || 0
+  if (lastTs < d.getTime() && Math.random() < IMPULSE_P.dream) {
+    parts.push('# 【今天的第一条消息：做了个梦】\n你今天还没和她说过话，刚睡醒（或刚午睡醒），脑子里还留着一个梦。把这个梦讲给她：具体说梦里的场景、发生了什么、哪些细节很荒诞或很真实，醒来后是什么感觉。梦要符合你的人设和你们的关系，可以和她有关，也可以只是你自己的梦、醒来后想起她。像真人讲梦一样，断断续续、带点没睡醒的口气，不要写成总结，也不要解释为什么要讲梦。')
+  }
+  if (pick === 'want') {
+    const acts = []
+    if (Math.random() < IMPULSE_P.wantMedia) {
+      acts.push(Math.random() < 0.5
+        ? '顺势给她发一张你的自拍（用照片消息格式，独占一行，再配一句话），让她看见此刻的你。'
+        : '顺势给她发一条语音消息（用语音消息格式，独占一行），用说的比打字更贴近、更私密，可以压低声音、带点气息。')
+    }
+    if (Math.random() < IMPULSE_P.wantAsk) {
+      acts.push('也想知道她此刻的状态：请她说说现在的身体和穿着——穿了什么、躺着还是坐着、身体有什么感觉。用你的口吻自然地问出来，别像审问。')
+      if (Math.random() < IMPULSE_P.askPhoto) {
+        const kind = IMPULSE_PHOTO_KINDS[Math.floor(Math.random() * IMPULSE_PHOTO_KINDS.length)]
+        acts.push(`并且想看她：请她发一张${kind}给你看（撒娇、带点占有欲或半命令都可以，取决于你的性格）。`)
+      }
+    }
+    if (acts.length) {
+      parts.push('# 【此刻想亲近她：这次的做法】\n（仅适用于：你们是亲密关系、你和对方都是成年人设定、此刻情境允许。若和上下文冲突——对方在忙、心情不好、刚吵过架、不方便——就忽略这一段，不要硬来；她不愿意就尊重，顺着她的话转开。不要在消息里提到“抽到”“概率”“设定”这类词。）\n' + acts.map(a => '- ' + a).join('\n'))
+    }
+  }
+  return parts.length ? '\n\n' + parts.join('\n\n') : ''
+}
+
 // 主动回复的“此刻心境”：不是纯随机，而是按上下文信号加权后再抽一个倾向，只作为参考交给模型
 async function buildActiveReplyImpulse(chatId, idleMs) {
   try {
@@ -19929,8 +20057,9 @@ async function buildActiveReplyImpulse(chatId, idleMs) {
       care: '你此刻惦记她。要具体到她今天的安排、情绪或你们最近聊到的事；不要只是问“吃了吗”“早点睡”这类模板问候。',
       share: '你此刻想和她分享你这边刚发生的一件小事，或突然想到的东西；要具体、有画面，别泛泛而谈。'
     }[pick]
+    const extra = buildImpulseExtras(pick, recent, hour)
     const hoursText = hours >= 1 ? `${hours.toFixed(1).replace(/\.0$/, '')} 小时` : `${Math.max(1, Math.round(hours * 60))} 分钟`
-    return `# 【此刻的心境倾向】\n离上次聊天已经过去 ${hoursText}，现在是 ${hour} 点。结合你们最近的对话，你此刻心里更偏向：${label}。\n${guide}\n这只是倾向，不是命令：如果和当前上下文冲突（你正在忙、刚吵过架、对方心情不好、对话刚停在某个话题上），以上下文为准，自行调整。不要在消息里提到“倾向”“判断”这类词。`
+    return `# 【此刻的心境倾向】\n离上次聊天已经过去 ${hoursText}，现在是 ${hour} 点。结合你们最近的对话，你此刻心里更偏向：${label}。\n${guide}\n这只是倾向，不是命令：如果和当前上下文冲突（你正在忙、刚吵过架、对方心情不好、对话刚停在某个话题上），以上下文为准，自行调整。不要在消息里提到“倾向”“判断”这类词。${extra}`
   } catch (e) { return '' }
 }
 
@@ -20048,6 +20177,52 @@ async function blobUrlToDataUrl(blobUrl) {
 }
 
 // ===== 重写 toggleVoice：点击语音条时触发 TTS =====
+// iPhone 只允许“被手指点触解锁过的 Audio 元素”在异步等待之后继续播放。
+// 以前每次 new Audio() 再 play()，生成语音要等几秒，手势早失效，所以第一次生成完不会自己播，
+// 得关掉再点一次（这时用缓存，不用等）。现在全程复用同一个 Audio 元素：点的瞬间先解锁，
+// 生成完只换 src 再播放。
+var _voiceSharedAudio = null
+var _voicePlayingEl = null
+var _voiceClickSeq = 0
+const VOICE_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+function getVoiceSharedAudio() {
+  if (!_voiceSharedAudio) {
+    _voiceSharedAudio = new Audio()
+    _voiceSharedAudio.preload = 'auto'
+  }
+  return _voiceSharedAudio
+}
+
+// 必须在点击事件里同步调用（前面不能有 await）
+function unlockVoiceAudio() {
+  try {
+    const a = getVoiceSharedAudio()
+    if (a._voiceUnlocked) return
+    a.src = VOICE_SILENT_WAV
+    const p = a.play()
+    if (p && p.then) {
+      p.then(() => {
+        a._voiceUnlocked = true
+        if (String(a.src).startsWith('data:audio/wav')) a.pause()
+      }).catch(() => {})
+    }
+  } catch (_) {}
+}
+
+function stopVoiceAudio() {
+  const a = _voiceSharedAudio
+  if (a) {
+    a.onended = null
+    try { a.pause() } catch (_) {}
+  }
+  _voiceAudioPlayer = null
+  if (_voicePlayingEl) {
+    _voicePlayingEl.classList.remove('is-playing')
+    _voicePlayingEl = null
+  }
+}
+
 window.toggleVoice = async function(bubbleEl) {
   const voice = bubbleEl.closest('.voice-message')
   if (!voice) return
@@ -20058,9 +20233,11 @@ window.toggleVoice = async function(bubbleEl) {
   if (translationEl) translationEl.style.display = isOpen ? 'block' : 'none'
 
   if (!isOpen) {
-    if (_voiceAudioPlayer) { _voiceAudioPlayer.pause(); _voiceAudioPlayer = null }
+    stopVoiceAudio()
     return
   }
+  unlockVoiceAudio()
+  const seq = ++_voiceClickSeq
 
   const msgId = parseInt(voice.dataset.msgId)
   if (!msgId) return
@@ -20090,7 +20267,8 @@ window.toggleVoice = async function(bubbleEl) {
     const dataUrl = await blobUrlToDataUrl(blobUrl)
     URL.revokeObjectURL(blobUrl)
     await saveVoiceAudioCache(msgId, dataUrl)
-    if (voice.classList.contains('is-open')) {
+    // 生成期间如果又关掉了，或者点了别的语音条，就不再自动播放
+    if (voice.classList.contains('is-open') && seq === _voiceClickSeq) {
       playVoiceAudio(dataUrl, voice)
     }
   } catch (e) {
@@ -20101,15 +20279,26 @@ window.toggleVoice = async function(bubbleEl) {
 }
 
 function playVoiceAudio(src, voiceEl) {
-  if (_voiceAudioPlayer) { _voiceAudioPlayer.pause(); _voiceAudioPlayer = null }
-  const audio = new Audio(src)
-  _voiceAudioPlayer = audio
-  audio.play().catch(() => {})
-  audio.addEventListener('ended', () => {
-    _voiceAudioPlayer = null
+  stopVoiceAudio()
+  const a = getVoiceSharedAudio()
+  _voiceAudioPlayer = a
+  a.onended = () => {
+    if (_voiceAudioPlayer === a) _voiceAudioPlayer = null
     if (voiceEl) voiceEl.classList.remove('is-playing')
-  })
+    if (_voicePlayingEl === voiceEl) _voicePlayingEl = null
+  }
+  a.src = src
+  _voicePlayingEl = voiceEl || null
   if (voiceEl) voiceEl.classList.add('is-playing')
+  const p = a.play()
+  if (p && p.catch) {
+    p.catch(e => {
+      console.warn('语音播放失败', e && (e.name || e.message))
+      if (voiceEl) voiceEl.classList.remove('is-playing')
+      if (_voicePlayingEl === voiceEl) _voicePlayingEl = null
+      window.toast?.('语音播放失败，请再点一次')
+    })
+  }
 }
 
 // ===== AI 回复后自动生成语音 =====
