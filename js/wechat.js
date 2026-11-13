@@ -5439,6 +5439,9 @@ async function loadEarlierMessages(container) {
     }, WECHAT_RENDER_WINDOW)
     const earlier = earlierBatch.filter(m => parseMsgType(m.content, ctx.charName).type !== 'status-update')
     if (!earlier.length) { removeLoadEarlierButton(container); return }
+    // 更早的消息里可能有 AI 发的表情包：按名字补图并并入当前映射表
+    const extraStickers = await getStickerMapForMessages(chatId, earlier, ctx.charName)
+    ctx.stickerMap = Object.assign({}, ctx.stickerMap, extraStickers)
     const earlierTraces = await getMcpToolTracesForConversation(
       'chat',
       chatId,
