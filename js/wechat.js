@@ -115,6 +115,8 @@ const CHAT_TIME_GAP_MS = 10 * 60 * 1000
 // “重回”版本只在当前页面运行期保留，不写入任何持久化存储。
 const _privateReplyVersions = new Map()
 const _activeReplyTriggeredFingerprints = new Map()
+const _activeReplyFailCount = new Map() // 主动回复连续失败次数（后台失败不弹窗，之前会因此再也不重试）
+const _activeReplyRetryAfter = new Map() // 失败后多久之后才允许重试
 let _wechatActiveReplyMonitorStarted = false
 // 聊天首屏只渲染最近这么多条消息，往上点「加载更早」再补一窗，避免长聊天 DOM 过大致 iOS Safari 内存崩溃
 const WECHAT_RENDER_WINDOW = 60
@@ -396,6 +398,11 @@ function normalizeChatActiveReplySettings(value) {
 async function getChatActiveReplySettings(chatId) {
   const stored = await db.config.get(`chatActiveReply_${chatId}`)
   return normalizeChatActiveReplySettings(stored?.value)
+}
+
+async function setChatActiveReplyEnabled(chatId, enabled) {
+  const cur = await getChatActiveReplySettings(chatId)
+  await db.config.put({ key: `chatActiveReply_${chatId}`, value: { ...cur, enabled: !!enabled } })
 }
 
 function parseDayMinutes(value) {
@@ -2084,6 +2091,7 @@ function parseMsgType(content, charName, myName) {
   // 真实照片（特殊前缀）
   if (c.startsWith('__IMG__')) return { type: 'real-photo', data: { src: c.slice(7) } }
   if (c.startsWith('__LINK__')) return { type: 'link', data: parseLinkPayload(c.slice(8)) }
+  if (c.startsWith(SHOP_APPROVAL_PREFIX)) return { type: 'shop-approval', data: parseShopApprovalPayload(c.slice(SHOP_APPROVAL_PREFIX.length)) }
   if (c.startsWith('__TBDEAL__')) return { type: 'tb-deal', data: parseTbDealPayload(c.slice(10)) }
   if (c.startsWith('__YUMDEAL__')) return { type: 'yum-deal', data: parseYumDealPayload(c.slice(11)) }
   // 群聊新类型（特殊前缀）
@@ -2107,6 +2115,7 @@ function getWechatMessageDisplayPreview(msg, charName = '') {
     case 'photo':
     case 'real-photo': return '[图片]'
     case 'link': return '[链接]'
+    case 'shop-approval': return '[购物审批]'
     case 'transfer-recv':
     case 'transfer-resp': return '[转账]'
     case 'location': return '[位置]'
@@ -2535,6 +2544,7 @@ function renderBubbleHTML(msg, isSelf, charName, stickerMap, bilingualSettings) 
     case 'recall': return renderRecallRow(data, charName)
     case 'location': return renderLocationCard(data, cls)
     case 'link': return renderLinkCard(data, cls)
+    case 'shop-approval': return renderShopApprovalCard(data, msg, isSelf)
     case 'sticker': return renderStickerBubble(data, isSelf, msg, stickerMap)
     case 'call-record': return renderCallRecordBubble(data, cls)
     case 'red-packet': return renderRedPacketCard(data, msg)
@@ -4284,6 +4294,9 @@ function buildPlusPanelHTML() {
             <button class="plus-item" data-type="link">
               <div class="plus-icon"><i class="fa-solid fa-link"></i></div><span>链接</span>
             </button>
+            <button class="plus-item" data-type="shop-approval">
+              <div class="plus-icon"><i class="fa-solid fa-cart-shopping"></i></div><span>购物审批</span>
+            </button>
           </div>
         </div>
       </div>
@@ -4388,6 +4401,8 @@ function getMsgActionText(msg, charName) {
         : `[位置：${parsed.data.place || ''}]`
     case 'link':
       return buildLinkFallbackText(parsed.data)
+    case 'shop-approval':
+      return buildShopApprovalFallbackText(parsed.data, msg)
     default:
       return msg.content || ''
   }
@@ -4876,10 +4891,38 @@ function buildWechatRenderTimeline(messages, traces) {
   )
 }
 
+// AI 发的表情包消息只存了名字、没存图片：渲染前按名字从挂载库补图（只补当前窗口里用到的）
+const _wechatStickerMapCache = new Map()
+async function getStickerMapForMessages(chatId, msgs, charName) {
+  const need = new Set()
+  for (const m of msgs || []) {
+    if (m.stickerImage || !m.content || String(m.content).indexOf('的表情包：') < 0) continue
+    const p = parseMsgType(m.content, charName)
+    const name = p.type === 'sticker' ? String(p.data?.name || '').trim() : ''
+    if (name) need.add(name)
+  }
+  if (!need.size) return {}
+  let hit = _wechatStickerMapCache.get(chatId)
+  if (!hit || Date.now() - hit.at > 60000 || [...need].some(n => !(n in hit.map))) {
+    hit = { at: Date.now(), map: await getMountedStickerMap(chatId) }
+    _wechatStickerMapCache.set(chatId, hit)
+  }
+  const out = {}
+  need.forEach(n => { if (hit.map[n]) out[n] = hit.map[n] })
+  return out
+}
 // 加载并渲染消息
 async function loadChatMessages(page, chatId, options = {}) {
   const container = page.querySelector('#chat-messages')
   const charId = parseInt(page.dataset.charId)
+  // 搜索跳转：以目标消息为中心渲染一小段历史（jumpWindow），此时列表不是「最新」状态
+  const isJumpWindow = !!(options.jumpWindow && Array.isArray(options.pageMessages))
+  if (container?._wechatJumpMode && !isJumpWindow) {
+    // 正处于搜索跳转的历史位置时，任何普通刷新（发消息、收到回复等）都先回到最新消息再正常渲染
+    container._wechatJumpMode = false
+    container.querySelector('.chat-jump-latest')?.remove()
+    options = { ...options, scrollToBottom: true }
+  }
   const [char, timeSettings, bilingualSettings, msgs] = await Promise.all([
     getWechatDisplayCharacter(charId),
     getChatTimeSettings(chatId),
@@ -4892,7 +4935,7 @@ async function loadChatMessages(page, chatId, options = {}) {
   const mcpTraces = await getMcpToolTracesForConversation('chat', chatId, traceLowerBound)
   const charName = getWechatDisplayName(char)
   // 首屏消息已经携带 stickerImage；这里不读取整套挂载表情图片，避免大表情库拖慢聊天打开。
-  const stickerMap = {}
+  const stickerMap = await getStickerMapForMessages(chatId, msgs, charName)
   const visibleMsgs = msgs.filter(m => parseMsgType(m.content, charName).type !== 'status-update')
   const oldestVisible = visibleMsgs[0] || null
   const hasEarlier = oldestVisible ? await hasEarlierChatMessages(chatId, oldestVisible) : false
@@ -4905,6 +4948,10 @@ async function loadChatMessages(page, chatId, options = {}) {
     scrollToBottom: !!options.scrollToBottom,
     initialScrollToBottom: !!options.initialScrollToBottom
   })
+  if (isJumpWindow) {
+    container._wechatJumpMode = true
+    showChatJumpLatestBar(page, container)
+  }
   if (isAIReplyPending('chat', chatId)) applyTypingUI('chat', chatId, true)
 }
 
@@ -5112,6 +5159,269 @@ async function renderMessages(container, msgs, charId, charName, stickerMap, tim
   if (scrollRequestedAt) scrollChatToBottom(container, { requestedAt: scrollRequestedAt })
 }
 
+// ===== 聊天内搜索：查找聊天记录（按内容 / 按日期），点结果跳到对应消息并高亮 =====
+const CHAT_SEARCH_PAGE_SIZE = 50
+const CHAT_JUMP_BEFORE = 30
+const CHAT_JUMP_AFTER = 40
+// 这些类型 getMsgActionText 能给出可读文字；其余类型（红包、通话记录等）用摘要文字
+const CHAT_SEARCH_TEXT_TYPES = new Set(['text', 'quote', 'voice', 'photo', 'real-photo', 'sticker', 'transfer-recv', 'location', 'link', 'shop-approval'])
+
+function formatChatSearchTime(ts) {
+  const d = new Date(Number(ts) || 0)
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function formatChatSearchDateValue(ts) {
+  const d = new Date(Number(ts) || 0)
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+// 读取一个聊天的全部消息，只保留「可搜索的轻量文字索引」，不把大图等内容留在内存里
+async function buildChatSearchIndex(chatId, charName) {
+  const list = []
+  const push = m => {
+    if (!m || typeof m.content !== 'string' || !m.content) return
+    let type = ''
+    try { type = parseMsgType(m.content, charName).type } catch (e) { return }
+    if (type === 'status-update' || type === 'recall' || type === 'system-note' || type === 'transfer-resp') return
+    let text = ''
+    try {
+      text = CHAT_SEARCH_TEXT_TYPES.has(type)
+        ? getMsgActionText(m, charName)
+        : getWechatMessageDisplayPreview(m, charName)
+    } catch (e) { return }
+    text = String(text || '').trim()
+    if (!text) return
+    let lower = text.toLowerCase()
+    if (lower.length !== text.length) lower = text
+    list.push({ id: m.id, at: Number(m.createdAt) || 0, self: m.role === 'user', text, lower })
+  }
+  const run = op => window.runWanWanDBRead ? window.runWanWanDBRead(op) : op()
+  await run(async () => {
+    list.length = 0
+    try {
+      await db.messages.where('[chatId+createdAt]').between([chatId, Dexie.minKey], [chatId, Dexie.maxKey]).each(push)
+    } catch (e) {
+      list.length = 0
+      await db.messages.where('chatId').equals(chatId).each(push)
+    }
+  })
+  list.sort((a, b) => a.at - b.at || a.id - b.id)
+  return list
+}
+
+function buildChatSearchSnippet(text, lower, kw) {
+  const flat = text.replace(/[\r\n\t]/g, ' ')
+  const idx = lower.indexOf(kw)
+  if (idx < 0) return wcEscHtml(flat.slice(0, 80))
+  const start = Math.max(0, idx - 18)
+  const end = Math.min(flat.length, idx + kw.length + 60)
+  return (start > 0 ? '…' : '')
+    + wcEscHtml(flat.slice(start, idx))
+    + '<mark>' + wcEscHtml(flat.slice(idx, idx + kw.length)) + '</mark>'
+    + wcEscHtml(flat.slice(idx + kw.length, end))
+    + (end < flat.length ? '…' : '')
+}
+
+async function openChatHistorySearch(chatPage, chatId, charId, settingsPage) {
+  if (document.getElementById('chat-search-page')) return
+  const page = document.createElement('div')
+  page.id = 'chat-search-page'
+  page.className = 'full-page chat-search-page'
+  page.innerHTML = `
+    <div class="page-header">
+      <button class="header-back" id="cse-back" type="button"><i class="fa fa-angle-left"></i></button>
+      <span class="header-title">查找聊天记录</span>
+    </div>
+    <div class="cse-bar">
+      <div class="cse-field">
+        <i class="fa-solid fa-magnifying-glass"></i>
+        <input id="cse-input" type="search" placeholder="搜索" enterkeyhint="search" autocomplete="off" autocapitalize="off" spellcheck="false">
+      </div>
+    </div>
+    <label class="cse-date-row">
+      <span><i class="fa-regular fa-calendar"></i>按日期查找</span>
+      <input id="cse-date" type="date">
+    </label>
+    <div class="cse-list" id="cse-list"><div class="cse-hint">正在读取聊天记录…</div></div>
+  `
+  window.openPage(page)
+  const listEl = page.querySelector('#cse-list')
+  const inputEl = page.querySelector('#cse-input')
+  const dateEl = page.querySelector('#cse-date')
+  page.querySelector('#cse-back').addEventListener('click', () => window.closePage('chat-search-page'))
+
+  let index = []
+  let ready = false
+  let matches = []
+  let shown = 0
+  let kw = ''
+  let charName = ''
+  const selfName = (typeof _wechatUser !== 'undefined' && (_wechatUser?.nick || _wechatUser?.name)) || '我'
+
+  const showHint = text => { listEl.innerHTML = `<div class="cse-hint">${wcEscHtml(text)}</div>` }
+  const idleHint = () => showHint(index.length
+    ? `输入关键词搜索这个聊天里的 ${index.length} 条消息，或选择日期直接跳转`
+    : '这个聊天还没有可搜索的消息')
+
+  const renderMore = () => {
+    const slice = matches.slice(shown, shown + CHAT_SEARCH_PAGE_SIZE)
+    shown += slice.length
+    listEl.querySelector('.cse-more')?.remove()
+    const html = slice.map(r => `
+      <button class="cse-item" type="button" data-id="${r.id}">
+        <div class="cse-item-top">
+          <span class="cse-item-name">${wcEscHtml(r.self ? selfName : charName)}</span>
+          <span class="cse-item-time">${formatChatSearchTime(r.at)}</span>
+        </div>
+        <div class="cse-item-text">${buildChatSearchSnippet(r.text, r.lower, kw)}</div>
+      </button>`).join('')
+    listEl.insertAdjacentHTML('beforeend', html)
+    if (shown < matches.length) {
+      listEl.insertAdjacentHTML('beforeend', `<button class="cse-more" type="button">显示更多（还有 ${matches.length - shown} 条）</button>`)
+    }
+  }
+
+  const runSearch = () => {
+    kw = inputEl.value.trim().toLowerCase()
+    if (!ready) return
+    if (!kw) { matches = []; shown = 0; idleHint(); return }
+    matches = []
+    for (let i = index.length - 1; i >= 0; i--) {
+      if (index[i].lower.indexOf(kw) >= 0) matches.push(index[i])
+    }
+    shown = 0
+    if (!matches.length) { showHint('没有找到相关的聊天记录'); return }
+    listEl.innerHTML = `<div class="cse-count">共找到 ${matches.length} 条相关消息</div>`
+    renderMore()
+    listEl.scrollTop = 0
+  }
+
+  let timer = null
+  let composing = false
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(runSearch, 180) }
+  inputEl.addEventListener('compositionstart', () => { composing = true })
+  inputEl.addEventListener('compositionend', () => { composing = false; schedule() })
+  inputEl.addEventListener('input', () => { if (!composing) schedule() })
+  inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); inputEl.blur(); runSearch() } })
+
+  const goTo = id => jumpToChatMessage(chatPage, chatId, id)
+  listEl.addEventListener('click', e => {
+    const more = e.target.closest('.cse-more')
+    if (more) { renderMore(); return }
+    const item = e.target.closest('.cse-item')
+    if (item) goTo(parseInt(item.dataset.id, 10))
+  })
+  dateEl.addEventListener('change', () => {
+    if (!ready || !dateEl.value) return
+    const [y, mo, d] = dateEl.value.split('-').map(Number)
+    const start = new Date(y, mo - 1, d).getTime()
+    const end = new Date(y, mo - 1, d + 1).getTime()
+    const hit = index.find(r => r.at >= start && r.at < end)
+    if (!hit) { window.toast?.('这一天没有聊天记录'); return }
+    goTo(hit.id)
+  })
+
+  try {
+    const char = await getWechatDisplayCharacter(charId)
+    charName = getWechatDisplayName(char)
+    index = await buildChatSearchIndex(chatId, charName)
+  } catch (e) {
+    console.error('[chat-search] 读取聊天记录失败', e)
+    showHint('读取聊天记录失败，请退出再试一次')
+    return
+  }
+  ready = true
+  if (index.length) {
+    dateEl.min = formatChatSearchDateValue(index[0].at)
+    dateEl.max = formatChatSearchDateValue(index[index.length - 1].at)
+  }
+  if (inputEl.value.trim()) runSearch()
+  else idleHint()
+}
+
+function centerChatRow(container, row) {
+  const cs = getComputedStyle(container)
+  const top = parseFloat(cs.paddingTop) || 0
+  const bottom = parseFloat(cs.paddingBottom) || 0
+  const visibleH = container.clientHeight - top - bottom
+  const cr = container.getBoundingClientRect()
+  const rr = row.getBoundingClientRect()
+  const target = rr.height >= visibleH ? top : top + (visibleH - rr.height) / 2
+  container.scrollTop += (rr.top - cr.top) - target
+}
+
+function flashChatRow(row) {
+  row.classList.remove('msg-jump-flash')
+  void row.offsetWidth
+  row.classList.add('msg-jump-flash')
+  setTimeout(() => row.classList.remove('msg-jump-flash'), 2400)
+}
+
+function showChatJumpLatestBar(chatPage, container) {
+  container.querySelector('.chat-jump-latest')?.remove()
+  const wrap = document.createElement('div')
+  wrap.className = 'chat-jump-latest'
+  wrap.innerHTML = '<button type="button"><i class="fa-solid fa-angles-down"></i><span>回到最新消息</span></button>'
+  wrap.querySelector('button').addEventListener('click', () => {
+    refreshChat(chatPage, { scrollToBottom: true })
+  })
+  container.appendChild(wrap)
+}
+
+// 跳到某条消息并高亮：目标在当前列表里就直接滚过去；不在就以它为中心重新渲染一小段历史
+async function jumpToChatMessage(chatPage, chatId, msgId) {
+  const container = chatPage?.querySelector('#chat-messages')
+  if (!container || !chatPage.isConnected || !msgId) return
+  const rowSelector = `.msg-row[data-id="${msgId}"]`
+  window.closePage('chat-search-page')
+  window.closePage('chat-settings-page')
+  let row = container.querySelector(rowSelector)
+  if (!row) {
+    try {
+      const target = await db.messages.get(msgId)
+      if (!target) { window.toast?.('这条消息已经不存在了'); return }
+      const [before, after] = await Promise.all([
+        getChatMessagesBefore(chatId, target, CHAT_JUMP_BEFORE),
+        db.messages.where('[chatId+createdAt]')
+          .between([chatId, target.createdAt], [chatId, Dexie.maxKey], true, true)
+          .limit(CHAT_JUMP_AFTER).toArray()
+      ])
+      const map = new Map()
+      before.concat(after).forEach(m => map.set(m.id, m))
+      map.set(target.id, target)
+      const pageMessages = [...map.values()].sort((a, b) =>
+        (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0) || a.id - b.id)
+      const load = () => loadChatMessages(chatPage, chatId, { pageMessages, jumpWindow: true })
+      await (window.runWanWanDBRead ? window.runWanWanDBRead(load) : load())
+    } catch (e) {
+      console.error('[chat-search] 跳转失败', e)
+      window.toast?.('跳转失败，请再试一次')
+      return
+    }
+    row = container.querySelector(rowSelector)
+  }
+  if (!row) { window.toast?.('这条消息没有显示在聊天里'); return }
+  let touched = false
+  const markTouched = () => { touched = true }
+  container.addEventListener('touchstart', markTouched, { once: true, passive: true })
+  container.addEventListener('wheel', markTouched, { once: true, passive: true })
+  centerChatRow(container, row)
+  // 页面关闭动画期间位置可能还会变，图片加载后高度也会变：稍后再校正一次并高亮
+  setTimeout(() => {
+    const r = container.querySelector(rowSelector)
+    if (!r) return
+    if (!touched) centerChatRow(container, r)
+    flashChatRow(r)
+  }, 380)
+  setTimeout(() => {
+    const r = container.querySelector(rowSelector)
+    if (r && !touched) centerChatRow(container, r)
+  }, 1100)
+}
+
 // 点击「加载更早的消息」：往上再补一窗历史，保持当前滚动位置不跳
 async function loadEarlierMessages(container) {
   if (!container || container._wechatLoadingEarlier) return
@@ -5129,6 +5439,9 @@ async function loadEarlierMessages(container) {
     }, WECHAT_RENDER_WINDOW)
     const earlier = earlierBatch.filter(m => parseMsgType(m.content, ctx.charName).type !== 'status-update')
     if (!earlier.length) { removeLoadEarlierButton(container); return }
+    // 更早的消息里可能有 AI 发的表情包：按名字补图并并入当前映射表
+    const extraStickers = await getStickerMapForMessages(chatId, earlier, ctx.charName)
+    ctx.stickerMap = Object.assign({}, ctx.stickerMap, extraStickers)
     const earlierTraces = await getMcpToolTracesForConversation(
       'chat',
       chatId,
@@ -5482,6 +5795,14 @@ function bindMsgLongPress(container, charId) {
   const chatPage = container.closest('.chat-window-page')
   const chatId = chatPage?.dataset?.chatId ? parseInt(chatPage.dataset.chatId, 10) : null
   bindMessageActionTargets(container, () => ({ scope: 'chat', charId, chatId }))
+    container.querySelectorAll('.call-record-bubble').forEach(bubble => {
+    if (bubble.dataset.callBound === '1') return
+    bubble.dataset.callBound = '1'
+    bubble.addEventListener('click', () => {
+      const msgId = Number(bubble.closest('.msg-row')?.dataset?.id)
+      if (msgId) window.openCallRecordFromMessage?.(msgId)
+    })
+  })
   container.querySelectorAll('.link-card-taobao[data-taobao-url]').forEach(card => {
     if (card.dataset.taobaoBound === '1') return
     card.dataset.taobaoBound = '1'
@@ -5876,12 +6197,14 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       const notify = await getChatMsgNotifySettings(chatId)
       const thoughtTemplate = await getChatThoughtTemplateConfig(chatId)
-      let { thought, status, reply } = await generateAIReply(chatId, charId, {
+      const _aiResult = await generateAIReply(chatId, charId, {
         replyRequirement: options.replyRequirement,
         idleTriggerMode: options.idleTriggerMode,
         idleMinutes: options.idleMinutes,
+        impulseHint: options.impulseHint,
         allowMcp: options.allowMcp === true
       })
+      let { thought, status, reply } = _aiResult
       if (thoughtTemplate.enabled) {
         if (!thought || !String(thought).trim()) {
           const char = await window.getCharacter(charId)
@@ -5900,6 +6223,16 @@ function startPrivateAIReply(chatId, charId, options = {}) {
         thought = null
       }
       await updateCharacterStatusFromAI(chatId, charId, status)
+      await applyCharScheduleFromReply(chatId, charId, _aiResult)
+      await applyShopApprovalFromReply(chatId, _aiResult)
+      _activeReplyFailCount.delete(chatId)
+      // 套话句式润色（文风守卫）：特殊消息行 [xx的语音：…] 等原样保留，只改命中的普通文字行，失败就用原文
+      if (window.ProseGuard && window.ProseGuard.isEnabled('wechat') && typeof reply === 'string') {
+        try {
+          const pg = await window.ProseGuard.polishText(reply, { allow: 1, maxUnits: 4, protect: [/^\[[^\n]*\]$/m] })
+          if (pg.fixed) reply = pg.text
+        } catch (e) { console.warn('[wechat] 文风润色失败，使用原文', e) }
+      }
       const lines = splitMessageLines(reply)
       const base = Date.now()
       for (let i = 0; i < lines.length; i++) {
@@ -5979,6 +6312,22 @@ function startPrivateAIReply(chatId, charId, options = {}) {
       }
       else console.warn('[wechat] AI 回复失败:', e)
       if (e.diagnostic) console.warn('[wechat] AI 回复诊断:', e.diagnostic)
+      // 主动回复失败：10 分钟后重试，最多连续 3 次（以前失败后会一直等到下一条新消息才可能再触发）
+      if (options.idleTriggerMode) {
+        const fails = (_activeReplyFailCount.get(chatId) || 0) + 1
+        _activeReplyFailCount.set(chatId, fails)
+        if (fails < 3) {
+          _activeReplyTriggeredFingerprints.delete(chatId)
+          _activeReplyRetryAfter.set(chatId, Date.now() + 10 * 60 * 1000)
+        }
+        if (options.scheduleDueId) {
+          try {
+            const d = await charScheduleLoad()
+            const ev = d.events.find(x => x.id === options.scheduleDueId)
+            if (ev) { delete ev.notifiedAt; await charScheduleSave(d) }
+          } catch (_) {}
+        }
+      }
     } finally {
       _pendingAIReplies.delete(key)
       applyTypingUI('chat', chatId, false)
@@ -6171,7 +6520,56 @@ function _wcRegexSalvageFields(text) {
 function _wcStripCodeFences(s) {
   return s.replace(/```[a-z]*\s*\n?/gi, '').replace(/```/g, '').trim()
 }
-
+// 修复 JSON 字符串里未转义的英文双引号（角色用 [引用"我：原话"并回复：…] 格式时极易出现）、
+// 裸换行、尾逗号，并补全被截断的结尾；顶层对象结束后的多余文字会被丢掉
+function _wcRepairInnerQuotes(text) {
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  let out = ''
+  let inString = false
+  let escaped = false
+  const stack = []
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) { out += ch; escaped = false; continue }
+      if (ch === '\\') { out += ch; escaped = true; continue }
+      if (ch === '"') {
+        // 引号后面第一个非空白字符是 : } ] 或者 ", 下一个键/值" 时，才算字符串真正结束
+        let j = i + 1
+        while (j < text.length && /\s/.test(text[j])) j++
+        const nx = text[j]
+        let isEnd = nx === undefined || nx === ':' || nx === '}' || nx === ']'
+        if (!isEnd && nx === ',') {
+          let k = j + 1
+          while (k < text.length && /\s/.test(text[k])) k++
+          isEnd = k >= text.length || /["{\[\]}]/.test(text[k])
+        }
+        if (isEnd) { inString = false; out += ch } else { out += '\\"' }
+        continue
+      }
+      if (ch === '\n') { out += '\\n'; continue }
+      if (ch === '\r') continue
+      if (ch === '\t') { out += '\\t'; continue }
+      if (ch.charCodeAt(0) < 0x20) continue
+      out += ch
+      continue
+    }
+    if (ch === '"') { inString = true; out += ch; continue }
+    if (ch === '{' || ch === '[') { stack.push(ch); out += ch; continue }
+    if (ch === '}' || ch === ']') {
+      stack.pop()
+      out += ch
+      if (!stack.length) break
+      continue
+    }
+    out += ch
+  }
+  if (inString) out += '"'
+  out = out.replace(/[\s,:]+$/, '')
+  while (stack.length) out += stack.pop() === '{' ? '}' : ']'
+  return out.replace(/,\s*([}\]])/g, '$1')
+}
 function extractAIJson(text) {
   if (!text) return null
   const s = text.trim()
@@ -6188,6 +6586,14 @@ function extractAIJson(text) {
     candidates.push(inner)
   }
   candidates.push(s)
+ 
+  // 2.5 字符串里有未转义的英文双引号（引用原话时常见）→ 修复后再解析，避免被后面的“正则抢救”截断
+  for (const cand of candidates) {
+    const fixed = _wcRepairInnerQuotes(cand)
+    const o = fixed && _tryParseJsonObject(fixed)
+    if (o) return o
+  }
+
   // 3-5. 括号配对提取 → 修复重试 → 截断补全
   for (const cand of candidates) {
     const sliced = _wcSliceJsonObject(cand)
@@ -6212,7 +6618,98 @@ function extractAIJson(text) {
 function _cleanThoughtDecor(s) {
   return (s || '').trim().replace(/^["'""''「」]+|["'""''「」]+$/g, '').trim()
 }
+// 模型有时会把特殊消息（引用 / 语音 / 位置等）和后面的普通话写在同一行，整行就被当成普通文字显示出来。
+// 这里在"一条完整的特殊消息"后面补一个换行，让它们各自成为独立的气泡。
+function _wcSeparateTrailingSpecialMessage(line) {
+  const s = String(line || '').trim()
+  if (!s.startsWith('[')) return s
+  let idx = s.indexOf(']')
+  while (idx !== -1) {
+    const tail = s.slice(idx + 1).trim()
+    if (!tail) return s
+    const head = s.slice(0, idx + 1)
+    // 括号必须成对（引用的原话或回复里可能自带 [笑] 这样的方括号）
+    const balanced = (head.match(/\[/g) || []).length === (head.match(/\]/g) || []).length
+    if (balanced && parseMsgType(head).type !== 'text') {
+      return head + '\n' + _wcSeparateTrailingSpecialMessage(tail)
+    }
+    idx = s.indexOf(']', idx + 1)
+  }
+  return s
+}
+ 
+// ===== 语音消息格式兜底 =====
+// 模型常见的写坏方式：语音块夹在普通文字中间、冒号写成英文、括号全半角混用、结尾漏掉 ]。
+// 这里先把每个语音块修回标准的 [某某的语音：内容]，并让它独占一行，再交给后面的拆分逻辑。
+const _WC_VOICE_OPEN_RE = /[\[［【(（]\s*([^\s\[\]［］【】()（）:：，。！？、]{1,20}?)\s*的\s*语音\s*[:：︰﹕]\s*/g
 
+// 语音内容里，开头或句末标点后面的 (语气) / （语气） / [语气] 修回 【语气】
+function _wcFixVoiceTags(text) {
+  return String(text || '').replace(/(^|[。！？!?…~～，,、\s])[(（]\s*([^()（）\[\]【】\n]{1,10}?)\s*[)）]/g, '$1【$2】')
+}
+
+function _wcNormalizeVoiceLine(line) {
+  const src = String(line || '')
+  if (!/的\s*语音\s*[:：︰﹕]/.test(src)) return src
+  // 找出所有语音块的起点
+  const starts = []
+  _WC_VOICE_OPEN_RE.lastIndex = 0
+  let m
+  while ((m = _WC_VOICE_OPEN_RE.exec(src))) {
+    starts.push({ index: m.index, contentStart: m.index + m[0].length, name: m[1] })
+  }
+  if (!starts.length) return src
+  const out = []
+  let cursor = 0
+  for (let i = 0; i < starts.length; i++) {
+    const st = starts[i]
+    if (st.index < cursor) continue
+    const before = src.slice(cursor, st.index).trim()
+    if (before) out.push(before)
+    const limit = i + 1 < starts.length ? starts[i + 1].index : src.length
+    // 从内容起点往后找结尾的 ]：【】标签内部的括号不算，内容里成对的 [笑] 不算
+    let tagOpen = false
+    let depth = 0
+    let end = -1
+    // 外层括号如果写成了 【】 或 ()，对应的右括号也算结尾
+    const opener = src[st.index]
+    const altClose = opener === '【' ? '】' : opener === '(' ? ')' : opener === '（' ? '）' : ''
+    for (let k = st.contentStart; k < limit; k++) {
+      const ch = src[k]
+      if (altClose && ch === altClose && !tagOpen && depth === 0) { end = k; break }
+      if (ch === '【') tagOpen = true
+      else if (ch === '】') tagOpen = false
+      else if (tagOpen) continue
+      else if (ch === '[' || ch === '［') depth++
+      else if (ch === ']' || ch === '］') {
+        if (depth > 0) depth--
+        else { end = k; break }
+      }
+    }
+    let content
+    if (end === -1) {
+      // 没写结尾 ]：到下一个语音块之前，或到这一行结束
+      content = src.slice(st.contentStart, limit)
+      cursor = limit
+    } else {
+      content = src.slice(st.contentStart, end)
+      cursor = end + 1
+    }
+    content = _wcFixVoiceTags(content.trim())
+    if (content) out.push(`[${st.name}的语音：${content}]`)
+  }
+  const tail = src.slice(cursor).trim()
+  if (tail) out.push(tail)
+  return out.join('\n')
+}
+
+function _wcNormalizeVoiceFormat(reply) {
+  return String(reply || '').split(/\r?\n/).map(_wcNormalizeVoiceLine).join('\n')
+}
+
+function _wcSeparateSpecialMessages(reply) {
+  return String(reply || '').split(/\r?\n/).map(_wcSeparateTrailingSpecialMessage).join('\n')
+}
 function normalizeWechatAIFields(parsed) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('AI 返回格式异常，请重新发送一次')
@@ -6224,6 +6721,8 @@ function normalizeWechatAIFields(parsed) {
   let thought = typeof parsed.thought === 'string' ? parsed.thought : ''
   let status = typeof parsed.status === 'string' ? parsed.status : ''
   reply = reply.trim()
+  reply = _wcNormalizeVoiceFormat(reply)
+  reply = _wcSeparateSpecialMessages(reply)
   thought = _cleanThoughtDecor(thought)
   status = status.trim().slice(0, 15)
   if (!reply) throw new Error('AI 返回格式异常，请重新发送一次')
@@ -6231,7 +6730,20 @@ function normalizeWechatAIFields(parsed) {
   if (!visibleLines.length) throw new Error('AI 返回格式异常，请重新发送一次')
   if (thought.length > _WECHAT_THOUGHT_MAX) thought = thought.slice(0, _WECHAT_THOUGHT_MAX)
 
-  return { thought, status, reply }
+  let event = null
+  if (parsed.event && typeof parsed.event === 'object' && !Array.isArray(parsed.event)) {
+    event = {
+      title: typeof parsed.event.title === 'string' ? parsed.event.title : '',
+      start_in_minutes: parsed.event.start_in_minutes,
+      duration_minutes: parsed.event.duration_minutes
+    }
+  }
+  const eventDone = parsed.event_done === true || parsed.event_done === 'true'
+  let approval = null
+  if (parsed.approval && typeof parsed.approval === 'object' && !Array.isArray(parsed.approval)) {
+    approval = { title: String(parsed.approval.title || ''), decision: String(parsed.approval.decision || '') }
+  }
+  return { thought, status, reply, event, eventDone, approval }
 }
 
 // 组装报错诊断信息（结合 fetchAI 记录的最近一次响应元数据）
@@ -6287,6 +6799,7 @@ async function runWechatActiveReplyCheck() {
       if (!cfg.enabled) continue
       if (isNowInQuietHours(cfg)) continue
       if (isAIReplyPending('chat', chat.id)) continue
+      if ((_activeReplyRetryAfter.get(chat.id) || 0) > Date.now()) continue
       if (window.isCallActiveWith?.(chat.charId)) continue
       const char = await db.characters.get(chat.charId)
       if (!char || char.type === 'online_friend') continue
@@ -6294,13 +6807,37 @@ async function runWechatActiveReplyCheck() {
       if (!lastMessage) continue
       if (lastMessage.role !== 'assistant' && lastMessage.role !== 'user') continue
       const idleMs = Date.now() - (Number(lastMessage.createdAt) || 0)
-      if (!Number.isFinite(idleMs) || idleMs < cfg.intervalMinutes * 60 * 1000) continue
+      if (!Number.isFinite(idleMs)) continue
+      // 角色日程：他正在忙（上班/执飞…）就不打扰；到了预计结束时间还没报平安，就提前触发一次
+      const sched = await getCharScheduleState(chat.id)
+      if (sched.active) continue
+      let scheduleDue = null
+      if (sched.overdue && !sched.overdue.notifiedAt && Date.now() - sched.overdue.endAt >= 2 * 60000) {
+        if ((Number(lastMessage.createdAt) || 0) > sched.overdue.endAt) {
+          // 预计结束之后聊天里已经有新消息，不再单独提醒
+          sched.overdue.notifiedAt = Date.now()
+          await charScheduleSave(sched.data)
+        } else {
+          scheduleDue = sched.overdue
+        }
+      }
+      if (!scheduleDue && idleMs < cfg.intervalMinutes * 60 * 1000) continue
       const fingerprint = buildActiveReplyTriggerFingerprint(chat.id, lastMessage)
-      if (_activeReplyTriggeredFingerprints.get(chat.id) === fingerprint) continue
+      if (!scheduleDue && _activeReplyTriggeredFingerprints.get(chat.id) === fingerprint) continue
       _activeReplyTriggeredFingerprints.set(chat.id, fingerprint)
+      if (scheduleDue) {
+        scheduleDue.notifiedAt = Date.now()
+        await charScheduleSave(sched.data)
+      }
+      const triggerMode = lastMessage.role === 'assistant' ? 'followup' : 'auto_reply'
+      const impulseHint = (!scheduleDue && triggerMode === 'followup')
+        ? await buildActiveReplyImpulse(chat.id, idleMs)
+        : ''
       startPrivateAIReply(chat.id, chat.charId, {
-        idleTriggerMode: lastMessage.role === 'assistant' ? 'followup' : 'auto_reply',
-        idleMinutes: Math.max(1, Math.floor(idleMs / 60000))
+        idleTriggerMode: triggerMode,
+        idleMinutes: Math.max(1, Math.floor(idleMs / 60000)),
+        impulseHint,
+        scheduleDueId: scheduleDue ? scheduleDue.id : ''
       })
     } catch (err) {
       console.warn('[wechat] 主动回复巡检失败:', err)
@@ -6315,6 +6852,12 @@ function ensureWechatActiveReplyMonitorStarted() {
   setInterval(() => {
     runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
   }, CHAT_ACTIVE_REPLY_CHECK_MS)
+  // 从后台/锁屏回到前台时立刻巡检一次，不用等下一个 2 分钟
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      runWechatActiveReplyCheck().catch(err => console.warn('[wechat] 主动回复巡检异常:', err))
+    }
+  })
 }
 
 async function getChatHistoryLimit(chatId) {
@@ -6490,6 +7033,23 @@ function prefixWechatTimeAnchorToContent(content, anchor) {
   return `${anchor}\n${String(content || '')}`
 }
 
+// 给时间锚点加上“相对现在”的日期说明：今天 / 昨天 / 前天 / N天前，避免把前一天的事算到今天
+function getWechatRelativeDayLabel(timestamp, tzConfig) {
+  try {
+    const zone = getWechatTimeContextZones(tzConfig)[0]
+    const k1 = getWechatCalendarDateKey(timestamp, zone.timeZone)
+    const k0 = getWechatCalendarDateKey(Date.now(), zone.timeZone)
+    if (!k1 || !k0) return ''
+    const toDay = k => { const [y, m, d] = k.split('-').map(Number); return Date.UTC(y, m - 1, d) / 86400000 }
+    const diff = Math.round(toDay(k0) - toDay(k1))
+    if (diff === 0) return '今天'
+    if (diff === 1) return '昨天'
+    if (diff === 2) return '前天'
+    if (diff > 2) return `${diff}天前`
+  } catch (_) {}
+  return ''
+}
+
 function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
   const sourceMessages = Array.isArray(messages) ? messages : []
   const sourceTimeline = Array.isArray(timeline) ? timeline : []
@@ -6511,7 +7071,7 @@ function injectWechatHistoryTimeAnchors(messages, timeline, tzConfig) {
     if (!timeText) return { ...message }
     return {
       ...message,
-      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}]`)
+      content: prefixWechatTimeAnchorToContent(message.content, `[系统时间：${timeText}${getWechatRelativeDayLabel(timestamp, tzConfig) ? `（${getWechatRelativeDayLabel(timestamp, tzConfig)}）` : ''}]`)
     }
   })
 }
@@ -6541,6 +7101,14 @@ function buildPromptContextEstimateSummary(charCounts) {
 }
 
 function buildPromptContextEstimateHTML(summary) {
+  if (!summary) {
+    return `
+    <div class="cs-section cs-token-estimate">
+      <div class="cs-section-label">Token 预估</div>
+      <div class="cs-token-estimate-note">计算中…</div>
+    </div>
+  `
+  }
   const stats = buildPromptContextEstimateSummary(summary)
   const rows = [
     ['fa-brands fa-weixin', '微信聊天记录', stats.wechatChars, 'data-icon-wechat'],
@@ -6654,6 +7222,9 @@ function getWechatStickerImageSrc(message, name, stickerMap) {
 async function buildWechatAIHistoryMessage(item, options = {}) {
   if (item.kind !== 'online' || !item.message) return { role: item.role, content: item.content || '' }
   const parsed = parseMsgType(item.message.content || '')
+  if (parsed.type === 'shop-approval') {
+    return { role: item.role, content: buildShopApprovalFallbackText(parsed.data, item.message) }
+  }
   if (parsed.type === 'tb-deal') {
     return { role: item.role, content: buildTbDealFallbackText(parsed.data) }
   }
@@ -6704,6 +7275,7 @@ async function buildWechatAIHistoryMessage(item, options = {}) {
 function buildWechatTextFallbackContent(item, options = {}) {
   if (item.kind !== 'online' || !item.message) return item.content || ''
   const parsed = parseMsgType(item.message.content || '')
+  if (parsed.type === 'shop-approval') return buildShopApprovalFallbackText(parsed.data, item.message)
   if (parsed.type === 'tb-deal') return buildTbDealFallbackText(parsed.data)
   if (parsed.type === 'yum-deal') return buildYumDealFallbackText(parsed.data)
   if (parsed.type === 'link') return buildLinkFallbackText(parsed.data)
@@ -6972,7 +7544,9 @@ function buildWechatOnlineTurnUnits(events) {
   return units
 }
 
-function buildWechatRoundTimeline(roundUnits) {
+function buildWechatRoundTimeline(roundUnits, options = {}) {
+  // 已结束且已总结进长期记忆的线下见面，默认只留一句话占位，不再把整段原文发给线上聊天/通话
+  const collapseSummarizedOffline = options.collapseSummarizedOffline !== false
   const result = []
   const units = Array.isArray(roundUnits) ? roundUnits : []
 
@@ -7007,6 +7581,16 @@ function buildWechatRoundTimeline(roundUnits) {
     if (unit.kind !== 'offline-round') return
     const session = unit.session
     if (!session || !session.messages?.length) return
+    if (collapseSummarizedOffline && session.ended && session.summarized) {
+      const d = new Date(session.startAt || session.endAt || Date.now())
+      result.push({
+        kind: 'offline',
+        time: session.endAt || session.startAt || 0,
+        role: 'user',
+        content: `（之后你们线下见面过一次（${d.getMonth() + 1}月${d.getDate()}日）。这次见面已经结束，并已总结进你的长期记忆，具体经过以长期记忆为准；之后你们回到微信聊天。）`
+      })
+      return
+    }
     result.push({
       kind: 'offline',
       time: session.startAt || 0,
@@ -7116,7 +7700,49 @@ function getCallRecordSpokenText(message) {
     return { text: looksLikeBrokenJson ? '' : raw, valid: !looksLikeBrokenJson }
   }
 }
+// 把通话记录拆成逐句 [{role, text}]（供日记/记忆使用）
+function getCallRecordLines(record) {
+  const lines = []
+  for (const message of record?.messages || []) {
+    if (isCallStartControlMessage(message)) continue
+    if (message?.role !== 'assistant' && message?.role !== 'user') continue
+    const spoken = getCallRecordSpokenText(message)
+    if (!spoken.text) continue
+    lines.push({ role: message.role, text: spoken.text })
+  }
+  return lines
+}
+window.getCallRecordLines = getCallRecordLines
 
+// 给一批聊天消息，返回 Map(消息id → {type, duration, initiator, lines})
+window.getCallLinesForMessages = async function (chatId, msgs) {
+  const out = new Map()
+  try {
+    const re = /^\[(视频通话|语音通话)\s+(\d+:[0-5]\d)\]$/
+    const marks = (msgs || []).filter(m => re.test(String(m?.content || '').trim()))
+    if (!marks.length || !db.callRecords) return out
+    const rows = await db.callRecords.where('chatId').equals(chatId).toArray()
+    const callMap = buildCallRecordMap(rows)
+    for (const m of marks) {
+      const mm = String(m.content).trim().match(re)
+      const record = findCallRecordForMessage(m, mm[1], mm[2], m.createdAt || 0, callMap)
+      if (!record) continue
+      const lines = getCallRecordLines(record)
+      if (!lines.length) continue
+      out.set(m.id, { type: mm[1], duration: mm[2], initiator: record.initiator, lines })
+    }
+  } catch (e) { console.warn('展开通话内容失败', e) }
+  return out
+}
+
+// 通话结束/恢复/续接后，让记忆系统给这通电话单独总结
+function triggerCallMemory(chatId, charId, ownerUid, recordId) {
+  if (!recordId || !window.WanWanMemory?.summarizeCall) return
+  setTimeout(() => {
+    window.WanWanMemory.summarizeCall(chatId, charId, ownerUid, recordId)
+      .catch(e => console.warn('通话记忆总结失败', e))
+  }, 0)
+}
 function buildCallRecordTranscript(record, callType, duration, fallbackRole) {
   if (!Array.isArray(record?.messages)) return null
   const initiator = record.initiator === 'char' || record.initiator === 'user'
@@ -7170,6 +7796,7 @@ function buildWechatOfflineSessions(rows) {
     const ended = messages.some(m => m.endedAt)
     return {
       ended,
+      summarized: messages.some(m => m.meetSummaryStatus === 'summarized'),
       startAt: messages[0]?.createdAt || 0,
       endAt: Math.max(...messages.map(m => m.createdAt || 0)),
       messages
@@ -7195,7 +7822,7 @@ function hasLaterOnlineEvent(events, currentIndex, afterTime) {
 
 function formatWechatOfflineMessage(row) {
   const speaker = row.role === 'assistant' ? '角色' : '用户'
-  const text = String(row.content || '').trim()
+  const text = String(row.content || '').replace(/线下见面中[，,]\s*(?:角色|用户)\s*[：:]\s*/g, '').trim()
   if (!text) return ''
   return `线下见面中，${speaker}：${text}`
 }
@@ -7597,7 +8224,7 @@ async function generateAIReply(chatId, charId, options = {}) {
     scope: 'chat',
     conversationId: chatId
   }, context.textHistory || history)
-  const system = await buildChatSystem(char, loreSegments, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, options.replyRequirement, idleContext)
+  const system = await buildChatSystem(char, loreSegments, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, options.replyRequirement, idleContext, chatId)
   const avatarCtx = await buildWechatAvatarContext(charId)
   const nowTimestamp = Date.now()
   const gapContext = calculateWechatReplyGap(context.gapTimeline || context.timeline, options, nowTimestamp)
@@ -7651,6 +8278,14 @@ async function refreshChat(chatPage, options = {}) {
 
 
 // 合并全局世界书 + 本对话挂载的局部世界书（分段版：{ before, middle, after }）
+// 世界书条目标题以「[线上]」或「[线下]」开头时，只在对应场景使用（也兼容【线上】【线下】）。
+// scene: 'online'（微信聊天/通话/群聊）| 'offline'（想见你）；没写前缀的条目两边都用。
+function loreEntryMatchesScene(entry, scene) {
+  const m = String(entry?.title || '').match(/^\s*[\[【]\s*(线上|线下)\s*[\]】]/)
+  if (!m) return true
+  return (m[1] === '线上') === (scene !== 'offline')
+}
+
 async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
   const dialogText = recentMsgs.map(m => m.content || '').join(' ')
   const allBooks = (await db.config.get('lorebooks'))?.value || []
@@ -7663,6 +8298,7 @@ async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
     if (book.scope === 'personal' && !ids.includes(charId)) continue
     for (const entry of book.entries || []) {
       if (!entry.enabled) continue
+      if (!loreEntryMatchesScene(entry, 'online')) continue
       const hit = !entry.keywords?.length || entry.keywords.some(kw => kw && dialogText.includes(kw))
       if (hit) matched.push(entry)
     }
@@ -7680,6 +8316,7 @@ async function getChatLorebookContextSegments(chatId, charId, recentMsgs) {
       && !(b.charIds || []).includes(charId)
     )) {
       for (const entry of (book.entries || []).filter(e => e.enabled !== false)) {
+        if (!loreEntryMatchesScene(entry, 'online')) continue
         const hit = !entry.keywords?.length || entry.keywords.some(kw => dialogText.includes(kw))
         if (hit) matched.push(entry)
       }
@@ -7707,7 +8344,8 @@ async function getPrivateReplyIdleContext(chatId, options = {}) {
       enabled: true,
       mode: triggerMode,
       idleMinutes: Number.isFinite(explicitIdleMinutes) ? Math.max(1, explicitIdleMinutes) : 1,
-      lastAssistantMessageCreatedAt: 0
+      lastAssistantMessageCreatedAt: 0,
+      impulseHint: String(options?.impulseHint || '')
     }
   }
   const messages = await db.messages.where('chatId').equals(Number(chatId)).sortBy('createdAt')
@@ -7727,7 +8365,7 @@ async function getPrivateReplyIdleContext(chatId, options = {}) {
 
 
 // 构建聊天系统提示词（loreCtx 可为字符串或 { before, middle, after } 分段对象）
-async function buildChatSystem(char, loreCtx, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, replyRequirement = '', idleContext = null) {
+async function buildChatSystem(char, loreCtx, charName, userName, userNick, stickerNames, tzConfig, timeSettings, thoughtTemplate, memoryCtx, bilingualSettings, imageGenEnabled, replyRequirement = '', idleContext = null, chatId = null) {
   const loreSeg = (loreCtx && typeof loreCtx === 'object')
     ? loreCtx
     : { before: '', middle: loreCtx || '', after: '' }
@@ -7768,17 +8406,25 @@ async function buildChatSystem(char, loreCtx, charName, userName, userNick, stic
   const loreAfterBlock = loreSeg.after
     ? `# 【补充世界观设定】\n${loreSeg.after}\n\n---\n\n`
     : ''
-  let system = buildSystemPart5(charName, userName, thoughtTemplate) +
+    let system = buildSystemPart5(charName, userName, thoughtTemplate) +
     buildSystemBilingualPart(bilingualSettings) +
     buildSystemPart1(char, charName, loreSeg.middle, loreSeg.before) +
-    buildSystemMemoryPart(memoryCtx) +
-    part2 +
     loreAfterBlock +
     buildSystemPart3(charName, userName, stickerNames, imageGenEnabled) +
-    buildSystemPart4(charName, userName)
+    buildSystemPart4(charName, userName) +
+    buildSystemMemoryPart(memoryCtx) +
+    part2
 
   if (imageGenEnabled) system += '\n\n' + buildImagePromptGuide(charName, userName)
+  const ttsTagHintChat = await getTTSTagHint('chat', charName)
+  if (ttsTagHintChat) system += '\n\n' + ttsTagHintChat
+  if (window.ProseGuard && window.ProseGuard.isEnabled('wechat')) system += '\n\n# 【文风】\n' + window.ProseGuard.styleRule({ short: true, prefix: '- ' })
+  const scheduleCtxChat = await getScheduleContext()
+  if (scheduleCtxChat) system += '\n\n' + scheduleCtxChat
+  const charSchedChat = await getCharScheduleContext(chatId, charName)
+  if (charSchedChat) system += '\n\n' + charSchedChat
   if (idleContext?.enabled && idleContext.mode === 'followup') system += '\n\n' + buildSystemFollowupPart(idleContext)
+  if (idleContext?.enabled && idleContext.mode === 'followup' && idleContext.impulseHint) system += '\n\n' + idleContext.impulseHint
   if (idleContext?.enabled && idleContext.mode === 'auto_reply') system += '\n\n' + buildSystemAutoReplyPart(idleContext)
   const requirement = String(replyRequirement || '').trim()
   if (requirement) {
@@ -7891,6 +8537,9 @@ function buildSystemPart5(charName, userName, thoughtTemplate) {
 ${thoughtLine}
 - "status"：${charName}当前状态，**每轮必须更新**，必须简洁，1-15字左右，例如 "正在聊天"、"刚洗完澡"、"有点困"。不要写长句、不要加标点、不要写成对话。
 - "reply"：实际发给${userName}的内容，多条消息之间用 \\n 隔开。**必须至少包含一条可见聊天消息，不得只写状态更新格式。**
+- "event"（可选，没有就不要写这个字段）：当${charName}在这一轮消息里说出了一件会占用他一段时间、之后才能回消息的具体安排（上班、执飞、开会、出差、上课、出门办事等），填 {"title":"事件名，10字内","start_in_minutes":从现在起多少分钟后开始（马上开始填0）,"duration_minutes":预计持续多少分钟}。时长按事情的实际情况合理估算（比如执飞按航程），只填数字，不要写“明天”“待会儿”这类相对时间的文字。
+- "event_done"（可选）：当${charName}在这一轮消息里表示自己忙完了、落地了、下班了，填 true。
+- "approval"（可选）：当聊天记录里有状态为“待审批”的「购物审批」申请，并且你在这一轮回复里已经做出最终决定时，填 {"title":"商品名","decision":"approve 或 reject"}。如果你还想追问、讨价还价、没有最终决定，就不要写这个字段。决定要符合你的人设、你和${userName}的关系，以及价格和理由是否合理；批准或拒绝都要在回复里自然地说出你的理由，不要只写一个字。
 
 ✅ 正确：{"chain":"用户语气冲，可能累了…先稳住。","thought":"他今天心情不好，我得小心点…","status":"正在聊天","reply":"怎么了？\\n发生什么事了吗"}
 ✅ 无长推理：{"chain":"","thought":"他今天心情不好，我得小心点…","status":"有点担心","reply":"怎么了？\\n发生什么事了吗"}
@@ -7947,7 +8596,8 @@ function buildSystemPart2(timeStr, tod, userName, userNick, currentRelationText,
 你需要同时理解当前时间与聊天记录中的历史时间锚点。判断用户是在描述当下、回忆过去还是安排未来时，应结合消息发送时间、上下文语义与当前时间，不要只凭某个时间词武断判断。
 执行规则：
 1. 你的状态、行为、可能正在做的事情，必须与当前时间段（${tod}）逻辑一致。
-2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+2. 只有在用户明确描述“此刻”且内容与当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：${timeStr}（${tod}）`
   return `# 【Part 2: 当前情景】
 
@@ -7970,7 +8620,8 @@ function buildSystemPart2Tz(charName, charLoc, charTime, charTod, userName, user
 执行规则：
 1. ${charName}的状态、行为、可能正在做的事情，必须与${charTod}逻辑一致；判断与${userName}相关的时间逻辑（例如对方是否方便接听、是否在睡觉）时，须以${userTod}为准。
 2. 若双方日期或时段存在显著差异，应在确实影响当前话题时自然体现这种差异，不要机械报时。
-3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。`
+3. 只有在用户明确描述“此刻”且内容与其所在地当前时间确实冲突时，才可按人设自然表现疑惑或询问；若是在回忆、转述、回复旧话题或讨论计划，不要误判为时间矛盾。
+3. 聊天记录里的“[系统时间：…（昨天/前天/N天前）]”标记了其后消息发生的日期。标记为昨天或更早的事（吃过的饭、睡过的觉、做过的事）属于那一天，不要当成今天已经发生的事；今天的饭、觉、活动只按标记为“今天”的内容和当前时间来算。`
     : `- **当前时间**：此时${charName}处于${charLoc}，当前时间为${charTime}（${charTod}）；${userName}处于${userLoc}，当前时间为${userTime}（${userTod}）`
   return `# 【Part 2: 当前情景】
 
@@ -8123,6 +8774,7 @@ function handlePlusAction(chatPage, type) {
     case 'transfer':   showTransferSheet(chatPage); break
     case 'location':   showLocationSheet(chatPage); break
     case 'link':       showVirtualLinkSheet(chatPage); break
+    case 'shop-approval': showShopApprovalPage(chatPage); break
   }
 }
 
@@ -8151,6 +8803,186 @@ function isValidHttpUrl(url) {
   } catch (_) {
     return false
   }
+}
+
+// ===== 购物审批 =====
+// 用户在聊天加号面板里发起一张“购物审批”卡片；角色在回复里表态（批准/拒绝），卡片状态随之更新。
+// 只在聊天里生效：不读取商品链接，不联动钱包、不记账。配图单独存在消息的 shopImage 字段里，不会发给 AI。
+const SHOP_APPROVAL_PREFIX = '__SHOPAPPROVAL__'
+
+function normalizeShopApproval(d) {
+  d = d && typeof d === 'object' ? d : {}
+  return {
+    title: String(d.title || '').trim().slice(0, 60),
+    price: Number(d.price) > 0 ? Math.round(Number(d.price) * 100) / 100 : 0,
+    url: String(d.url || '').trim().slice(0, 300),
+    reason: String(d.reason || '').trim().slice(0, 500),
+    deadline: Number(d.deadline) > 0 ? Number(d.deadline) : 0
+  }
+}
+
+function parseShopApprovalPayload(raw) {
+  return normalizeShopApproval(_safeJsonParse(raw, {}))
+}
+
+function buildShopApprovalContent(d) {
+  return SHOP_APPROVAL_PREFIX + JSON.stringify(normalizeShopApproval(d))
+}
+
+function shopApprovalStatusLabel(status) {
+  return status === 'approved' ? '已批准' : status === 'rejected' ? '已拒绝' : '待审批'
+}
+
+function formatShopDeadline(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+function buildShopApprovalFallbackText(data, msg) {
+  const d = normalizeShopApproval(data)
+  const status = shopApprovalStatusLabel(msg && msg.shopStatus)
+  const me = (typeof _wechatUser !== 'undefined' && _wechatUser && (_wechatUser.nick || _wechatUser.name)) || '用户'
+  return `[购物审批申请（${me}想买东西，向你申请）：商品「${d.title}」；价格 ¥${d.price}；理由：${d.reason || '（未写）'}` +
+    (d.deadline ? `；截止时间：${formatShopDeadline(d.deadline)}` : '') +
+    (d.url ? `；商品链接：${d.url}（系统不会读取链接内容，不要假装看过）` : '') +
+    `；当前状态：${status}]`
+}
+
+function renderShopApprovalCard(data, msg, isSelf) {
+  const d = normalizeShopApproval(data)
+  const status = (msg && msg.shopStatus) || 'pending'
+  const img = msg && msg.shopImage
+    ? `<img src="${wcEscHtml(msg.shopImage)}" alt="">`
+    : '<i class="fa-solid fa-cart-shopping"></i>'
+  const deadline = d.deadline ? `<div class="shop-card-foot">截止时间：${wcEscHtml(formatShopDeadline(d.deadline))}</div>` : ''
+  return `
+    <div class="msg-card shop-card card-${isSelf ? 'self' : 'other'}" data-status="${status}">
+      <div class="shop-card-head"><span>购物审批</span><span class="shop-card-status status-${status}">${shopApprovalStatusLabel(status)}</span></div>
+      <div class="shop-card-body">
+        <div class="shop-card-img">${img}</div>
+        <div class="shop-card-main">
+          <div class="shop-card-title">${wcEscHtml(d.title)}</div>
+          <div class="shop-card-price">¥ ${wcEscHtml(d.price.toFixed(2))}</div>
+        </div>
+      </div>
+      <div class="shop-card-reason">${wcEscHtml(d.reason)}</div>
+      ${deadline}
+    </div>`
+}
+
+async function applyShopApprovalFromReply(chatId, result) {
+  try {
+    const ap = result && result.approval
+    if (!ap) return
+    const decision = /approve|批准|同意/i.test(ap.decision) ? 'approved' : /reject|拒绝|不同意/i.test(ap.decision) ? 'rejected' : ''
+    if (!decision) return
+    const rows = await db.messages.where('chatId').equals(Number(chatId)).reverse().limit(80).toArray()
+    const pending = rows.filter(r => r.role === 'user' && typeof r.content === 'string' &&
+      r.content.startsWith(SHOP_APPROVAL_PREFIX) && (r.shopStatus || 'pending') === 'pending')
+    if (!pending.length) return
+    const t = String(ap.title || '').trim()
+    let target = null
+    if (t) {
+      target = pending.find(r => {
+        const d = parseShopApprovalPayload(r.content.slice(SHOP_APPROVAL_PREFIX.length))
+        return d.title && (d.title.includes(t) || t.includes(d.title))
+      })
+    }
+    if (!target) target = pending[0] // 倒序读取，第一条就是最新的待审批
+    await db.messages.update(target.id, { shopStatus: decision })
+  } catch (e) { console.warn('[wechat] 更新购物审批状态失败', e) }
+}
+
+function shopCompressImage(src, maxSize = 240) {
+  return new Promise(resolve => {
+    const img = new Image()
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+        const w = Math.max(1, Math.round(img.width * scale))
+        const h = Math.max(1, Math.round(img.height * scale))
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h)
+        resolve(canvas.toDataURL('image/jpeg', 0.8))
+      } catch (_) { resolve('') }
+    }
+    img.onerror = () => resolve('')
+    img.src = src
+  })
+}
+
+function showShopApprovalPage(chatPage) {
+  if (chatPage?.dataset?.groupId) { window.toast?.('群聊里暂不支持购物审批'); return }
+  if (document.getElementById('shop-approval-page')) return
+  const now = new Date()
+  const page = document.createElement('div')
+  page.id = 'shop-approval-page'
+  page.className = 'full-page shop-approval-page'
+  page.innerHTML = `
+    <div class="shop-form-head">
+      <button class="shop-form-back" id="shop-back" type="button" aria-label="返回"><i class="fa-solid fa-angle-left"></i></button>
+      <div class="shop-form-titles"><div class="shop-form-title">购物审批</div><div class="shop-form-sub">填写并发起</div></div>
+    </div>
+    <div class="shop-form-scroll">
+      <div class="shop-form-card">
+        <div class="shop-form-top"><span>购物审批</span><span>${now.getMonth() + 1}/${now.getDate()}</span></div>
+        <div class="shop-form-grid">
+          <div class="shop-form-cell shop-form-imgcell">
+            <label>配图</label>
+            <button class="shop-img-btn" id="shop-img-btn" type="button" aria-label="选择配图"><i class="fa-solid fa-cart-shopping"></i></button>
+          </div>
+          <div class="shop-form-right">
+            <div class="shop-form-cell"><label>商品名称 <b>*</b></label><input id="shop-title" type="text" maxlength="60" autocomplete="off"></div>
+            <div class="shop-form-cell"><label>价格 <b>*</b></label><input id="shop-price" type="text" inputmode="decimal" placeholder="0.00" autocomplete="off"></div>
+          </div>
+        </div>
+        <div class="shop-form-cell"><label>商品链接</label><input id="shop-url" type="text" autocomplete="off"></div>
+        <div class="shop-form-cell"><label>我为什么想买 <b>*</b></label><textarea id="shop-reason" rows="7" maxlength="500"></textarea></div>
+        <div class="shop-form-cell"><label>截止时间</label><input id="shop-deadline" type="datetime-local"></div>
+      </div>
+    </div>
+    <div class="shop-form-foot"><button class="shop-send-btn" id="shop-send" type="button">发起</button></div>`
+  let imageData = ''
+  page.querySelector('#shop-back').addEventListener('click', () => window.closePage('shop-approval-page'))
+  page.querySelector('#shop-img-btn').addEventListener('click', () => {
+    window.showImagePicker?.(async url => {
+      if (!url) return
+      const thumb = await shopCompressImage(url)
+      if (!thumb) { window.toast?.('这张图片读取失败'); return }
+      imageData = thumb
+      const btn = page.querySelector('#shop-img-btn')
+      btn.innerHTML = `<img src="${thumb}" alt="">`
+    })
+  })
+  page.querySelector('#shop-send').addEventListener('click', async e => {
+    const btn = e.currentTarget
+    if (btn.disabled) return
+    const title = page.querySelector('#shop-title').value.trim()
+    const price = parseFloat(page.querySelector('#shop-price').value.replace(/[^\d.]/g, ''))
+    const url = page.querySelector('#shop-url').value.trim()
+    const reason = page.querySelector('#shop-reason').value.trim()
+    const dl = page.querySelector('#shop-deadline').value
+    const deadline = dl ? Date.parse(dl) : 0
+    if (!title) { window.toast?.('请填写商品名称'); return }
+    if (!(price > 0)) { window.toast?.('请填写价格'); return }
+    if (!reason) { window.toast?.('请写一下为什么想买'); return }
+    btn.disabled = true
+    try {
+      await sendUserMsg(chatPage, buildShopApprovalContent({ title, price, url, reason, deadline }), { shopStatus: 'pending', shopImage: imageData || '' })
+      window.closePage('shop-approval-page')
+      window.toast?.('已发起，点聊天里的魔法棒让对方回复')
+    } catch (err) {
+      console.warn('[wechat] 发起购物审批失败', err)
+      window.toast?.('发起失败，请重试')
+      btn.disabled = false
+    }
+  })
+  window.openPage(page)
 }
 
 function showVirtualLinkSheet(chatPage) {
@@ -8395,6 +9227,13 @@ async function renderEmojiPanel(chatPage) {
         if (btn.dataset.sending === '1') return
         const sticker = stickers.find(x => x.id === parseInt(btn.dataset.id))
         if (!sticker) return
+        // 第一次点击只选中（下方出现红栏「确认发送」），再点一次才真正发送，避免滑动误触
+        if (!btn.classList.contains('sp-armed')) {
+          gridEl.querySelectorAll('.sp-tile.sp-armed').forEach(t => t.classList.remove('sp-armed'))
+          btn.classList.add('sp-armed')
+          return
+        }
+        btn.classList.remove('sp-armed')
         btn.dataset.sending = '1'
         btn.disabled = true
         try {
@@ -8885,25 +9724,46 @@ async function showMsgMenu(anchorEl, msgId, context) {
   setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 100)
 }
 
-// 定位菜单
+// 定位菜单：始终贴在对应消息的上缘（放不下才放下缘）
+// iPhone 弹出输入法时，整页(layout viewport)和看得见的区域(visual viewport)会错开，
+// 菜单所在容器也可能被位移。这里不再假设“fixed 的 0,0 就是屏幕左上角”，
+// 而是先量出菜单自己的原点、再量出真实可见区域，都和消息气泡用同一套坐标系来算。
 function positionMsgMenu(menu, bubbleEl) {
   const rect = bubbleEl.getBoundingClientRect()
   const gap = 8
   const edge = 8
-  const menuRect = menu.getBoundingClientRect()
-  const menuWidth = menuRect.width
-  const menuHeight = menuRect.height
-  const viewportWidth = window.innerWidth
-  const viewportHeight = window.innerHeight
-  const maxLeft = Math.max(edge, viewportWidth - menuWidth - edge)
-  const left = Math.min(Math.max(rect.left, edge), maxLeft)
+  menu.style.top = '0px'
+  menu.style.left = '0px'
+  const origin = menu.getBoundingClientRect()
+  const menuWidth = menu.offsetWidth || origin.width
+  const menuHeight = menu.offsetHeight || origin.height
+  // 真实可见区域（和 getBoundingClientRect 同一坐标系）
+  const vv = window.visualViewport
+  let visTop = 0
+  let visLeft = 0
+  let visWidth = window.innerWidth
+  let visHeight = window.innerHeight
+  try {
+    const probe = document.createElement('div')
+    probe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none'
+    document.documentElement.appendChild(probe)
+    const pr = probe.getBoundingClientRect()
+    probe.remove()
+    visTop = pr.top + (vv ? vv.offsetTop : 0)
+    visLeft = pr.left + (vv ? vv.offsetLeft : 0)
+    if (vv) { visWidth = vv.width; visHeight = vv.height }
+  } catch (_) {}
+  const minLeft = visLeft + edge
+  const maxLeft = Math.max(minLeft, visLeft + visWidth - menuWidth - edge)
+  const left = Math.min(Math.max(rect.left, minLeft), maxLeft)
+  const minTop = visTop + edge
+  const maxTop = Math.max(minTop, visTop + visHeight - menuHeight - edge)
   const topAbove = rect.top - menuHeight - gap
   const topBelow = rect.bottom + gap
-  const top = topAbove >= edge
-    ? topAbove
-    : Math.min(topBelow, Math.max(edge, viewportHeight - menuHeight - edge))
-  menu.style.top = top + 'px'
-  menu.style.left = left + 'px'
+  let top = topAbove >= minTop ? topAbove : topBelow
+  top = Math.min(Math.max(top, minTop), maxTop)
+  menu.style.top = (top - origin.top) + 'px'
+  menu.style.left = (left - origin.left) + 'px'
 }
 
 // 绑定菜单按钮
@@ -9624,59 +10484,88 @@ async function showCharThoughtsHistory(charId, chatId) {
     sheet.querySelector('#btn-thought-history').addEventListener('click', renderHistory)
     sheet.querySelector('#btn-thought-close').addEventListener('click', close)
   }
-  const renderHistory = async () => {
-    if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
-      historyIndex = historyThoughts.length - 1
+  // 历史卡片只渲染当前这张和前后各一张，避免一次性生成大量卡片（头像、模板 HTML）导致 iPhone 白屏
+  const buildHistorySlideInner = (m) => {
+    try {
+      return buildThoughtCardHTML(m, templateConfig, charName, char)
+    } catch (e) {
+      console.warn('[wechat] 心声历史卡片渲染失败', e)
+      return `<div class="thought-card-frame"><div class="thought-card-scroll"><div class="thought-card"><div class="thought-card-body">${wcEscHtml(m?.thought || '')}</div></div></div></div>`
     }
-    const favStates = await Promise.all(historyThoughts.map(m => isThoughtFavorited(m.id)))
-    const cardsHtml = historyThoughts.length
-      ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${buildThoughtCardHTML(m, templateConfig, charName, char)}</div>`).join('')
-      : '<div class="thought-history-empty">还没有历史心声</div>'
-    sheet.innerHTML = `
-      <div class="thought-history-panel">
-        <div class="thought-history-slider">${cardsHtml}</div>
-        <div class="thought-history-actions">
-          <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
-          ${historyThoughts.length ? buildThoughtFavBtnHTML(favStates[historyIndex] || false, 'btn-thought-hist-fav') : ''}
-          <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+  }
+  const renderHistory = async () => {
+    try {
+      if (historyThoughts.length && (historyIndex < 0 || historyIndex >= historyThoughts.length)) {
+        historyIndex = historyThoughts.length - 1
+      }
+      const currentFav = historyThoughts.length ? await isThoughtFavorited(historyThoughts[historyIndex].id) : false
+      const cardsHtml = historyThoughts.length
+        ? historyThoughts.map((m, i) => `<div class="thought-history-slide" data-slide-index="${i}">${Math.abs(i - historyIndex) <= 1 ? buildHistorySlideInner(m) : ''}</div>`).join('')
+        : '<div class="thought-history-empty">还没有历史心声</div>'
+      sheet.innerHTML = `
+        <div class="thought-history-panel">
+          <div class="thought-history-slider">${cardsHtml}</div>
+          <div class="thought-history-actions">
+            <button class="thought-round-btn" id="btn-thought-back" title="返回" aria-label="返回"><i class="fa-solid fa-right-from-bracket"></i></button>
+            ${historyThoughts.length ? buildThoughtFavBtnHTML(currentFav, 'btn-thought-hist-fav') : ''}
+            <button class="thought-round-btn thought-round-btn-danger" id="btn-thought-delete" title="删除" aria-label="删除" ${historyThoughts.length ? '' : 'disabled'}><i class="fa fa-trash"></i></button>
+          </div>
         </div>
-      </div>
-    `
-    const slider = sheet.querySelector('.thought-history-slider')
-    if (slider) {
-      slider.addEventListener('scroll', async () => {
-        const width = slider.clientWidth || 1
-        const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
-        if (newIndex !== historyIndex) {
-          historyIndex = newIndex
-          const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-          if (histFavBtn) {
-            const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
-            histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
-            histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+      `
+      const slider = sheet.querySelector('.thought-history-slider')
+      if (slider) {
+        // 去掉 rtl + 平滑滚动：iOS Safari 在弹窗里的 rtl 横向吸附滚动不稳定
+        slider.style.direction = 'ltr'
+        slider.style.scrollBehavior = 'auto'
+        if (historyThoughts.length) slider.scrollLeft = historyIndex * (slider.clientWidth || 0)
+        const fillSlides = () => {
+          for (let i = Math.max(0, historyIndex - 1); i <= Math.min(historyThoughts.length - 1, historyIndex + 1); i++) {
+            const slide = slider.querySelector(`.thought-history-slide[data-slide-index="${i}"]`)
+            if (slide && !slide.firstElementChild) slide.innerHTML = buildHistorySlideInner(historyThoughts[i])
           }
         }
-      })
-    }
-    const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
-    if (histFavBtn) {
-      histFavBtn.addEventListener('click', async () => {
+        let scrollTimer = null
+        slider.addEventListener('scroll', () => {
+          clearTimeout(scrollTimer)
+          scrollTimer = setTimeout(async () => {
+            const width = slider.clientWidth || 1
+            const newIndex = Math.max(0, Math.min(historyThoughts.length - 1, Math.round(Math.abs(slider.scrollLeft) / width)))
+            if (newIndex === historyIndex) return
+            historyIndex = newIndex
+            fillSlides()
+            const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+            if (histFavBtn && historyThoughts[historyIndex]) {
+              const fav = await isThoughtFavorited(historyThoughts[historyIndex].id)
+              histFavBtn.className = `thought-round-btn ${fav ? 'thought-fav-active' : ''}`
+              histFavBtn.innerHTML = fav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+            }
+          }, 80)
+        })
+      }
+      const histFavBtn = sheet.querySelector('#btn-thought-hist-fav')
+      if (histFavBtn) {
+        histFavBtn.addEventListener('click', async () => {
+          const target = historyThoughts[historyIndex]
+          if (!target) return
+          const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
+          histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
+          histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        })
+      }
+      sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
+      sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
         const target = historyThoughts[historyIndex]
         if (!target) return
-        const nowFav = await toggleThoughtFavorite(target, charName, char, templateConfig)
-        histFavBtn.className = `thought-round-btn ${nowFav ? 'thought-fav-active' : ''}`
-        histFavBtn.innerHTML = nowFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-regular fa-star"></i>'
+        await clearThoughtMessage(target.id, chatId)
+        historyThoughts = historyThoughts.filter(m => m.id !== target.id)
+        if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
+        renderHistory()
       })
+    } catch (error) {
+      console.error('[wechat] 心声历史渲染失败', error)
+      window.toast && window.toast('历史心声加载失败：' + (error?.message || String(error)))
+      renderCurrent()
     }
-    sheet.querySelector('#btn-thought-back').addEventListener('click', renderCurrent)
-    sheet.querySelector('#btn-thought-delete').addEventListener('click', async () => {
-      const target = historyThoughts[historyIndex]
-      if (!target) return
-      await clearThoughtMessage(target.id, chatId)
-      historyThoughts = historyThoughts.filter(m => m.id !== target.id)
-      if (historyIndex >= historyThoughts.length) historyIndex = Math.max(0, historyThoughts.length - 1)
-      renderHistory()
-    })
   }
   renderCurrent()
   document.getElementById('app').appendChild(overlay)
@@ -15774,68 +16663,91 @@ async function showStartChatModal(page) {
 
 
 // ===== 聊天设置页 =====
+let _chatSettingsOpening = false
 async function openChatSettings(chatId, charId, chatPage) {
-  const char = await window.getCharacter(charId)
-  const profile = await getWechatProfile(_wechatUid, charId)
-  const memory = await db.config.get(`chatMemory_${chatId}`)
-  const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
-  const historyLimit = clampWechatMemoryLimit(memoryValue)
-  const settingsPage = document.createElement('div')
-  settingsPage.id = 'chat-settings-page'
-  settingsPage.className = 'full-page'
-  settingsPage.dataset.charName = getWechatDisplayName(char)
-  const mounted = await db.config.get(`chatLore_${chatId}`)
-  const lorebooksRaw = await db.config.get('lorebooks')
-  const lorebooks = lorebooksRaw?.value || []
-  const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
-  if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
-    await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+  // 防止在页面还没出来时连点，打开多个设置页叠在一起造成闪烁
+  if (_chatSettingsOpening) return
+  _chatSettingsOpening = true
+  try {
+    // 这些读取互不依赖，一起并行读，比一个一个等快得多
+    const [
+      char, profile, memory, mounted, lorebooksRaw, appearance, stickerCats, mountedStickerIds,
+      tzStored, statusDisplay, activeReplySettings, timeSettings, bilingualSettings, imageGenSettings,
+      stickerImageInputEnabled, thoughtTemplateStored, thoughtPresets, chatBeautyStored, chatBeautyPresets,
+      longMemorySettings, longMemoryCount, voiceIdStored, msgNotify
+    ] = await Promise.all([
+      window.getCharacter(charId),
+      getWechatProfile(_wechatUid, charId),
+      db.config.get(`chatMemory_${chatId}`),
+      db.config.get(`chatLore_${chatId}`),
+      db.config.get('lorebooks'),
+      db.config.get(`chatAppearance_${chatId}`),
+      getAllStickerCategories(),
+      getMountedStickerCatIds(chatId),
+      db.config.get(`chatTimezone_${chatId}`),
+      getChatStatusDisplayConfig(chatId),
+      getChatActiveReplySettings(chatId),
+      getChatTimeSettings(chatId),
+      getChatBilingualSettings(chatId),
+      getChatImageGenSettings(chatId),
+      getChatStickerImageInputEnabled(chatId),
+      db.config.get(`chatThoughtTemplate_${chatId}`),
+      getThoughtPresets(),
+      db.config.get(`chatBeauty_${chatId}`),
+      getChatBeautyPresets(),
+      window.WanWanMemory?.getSettings
+        ? window.WanWanMemory.getSettings(chatId)
+        : Promise.resolve({ enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }),
+      db.memories
+        ? db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
+        : Promise.resolve(0),
+      db.config.get(`chatVoiceId_${chatId}`),
+      getChatMsgNotifySettings(chatId)
+    ])
+    const memoryValue = typeof memory?.value === 'object' ? memory.value.historyLimit : memory?.value
+    const historyLimit = clampWechatMemoryLimit(memoryValue)
+    const settingsPage = document.createElement('div')
+    settingsPage.id = 'chat-settings-page'
+    settingsPage.className = 'full-page'
+    settingsPage.dataset.charName = getWechatDisplayName(char)
+    const lorebooks = lorebooksRaw?.value || []
+    const mountedIds = normalizeChatLoreMountIds(mounted?.value, lorebooks, charId)
+    if (!areChatLoreMountIdsEqual(mounted?.value, mountedIds)) {
+      await db.config.put({ key: `chatLore_${chatId}`, value: mountedIds })
+    }
+    const appearanceValue = normalizeChatAppearance(appearance?.value)
+    // 同时拉取每个分组下表情数量，便于在设置页显示
+    const counts = await Promise.all(stickerCats.map(c => db.stickers.where('categoryId').equals(c.id).count()))
+    const stickerCounts = {}
+    stickerCats.forEach((c, i) => { stickerCounts[c.id] = counts[i] })
+    const tzConfig = tzStored?.value || {}
+    const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
+    const chatBeautyRaw = chatBeautyStored?.value || {}
+    const voiceId = voiceIdStored?.value || ''
+    settingsPage.innerHTML = buildChatSettingsHTML(
+      char, profile, historyLimit,
+      lorebooks, mountedIds, appearanceValue,
+      stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
+      activeReplySettings,
+      bilingualSettings, imageGenSettings, stickerImageInputEnabled,
+      chatBeautyRaw, chatBeautyPresets,
+      longMemorySettings, longMemoryCount,
+      null, // Token 预估最耗时（要把整段聊天记录、记忆、世界书都拼一遍），页面打开之后再补
+      voiceId, msgNotify
+    )
+    window.openPage(settingsPage)
+    bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
+    estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit).then(estimate => {
+      const slot = settingsPage.querySelector('.cs-token-estimate')
+      if (slot && settingsPage.isConnected) slot.outerHTML = buildPromptContextEstimateHTML(estimate)
+    }).catch(err => {
+      console.warn('[wechat] Token 预估失败', err)
+      const note = settingsPage.querySelector('.cs-token-estimate .cs-token-estimate-note')
+      if (note) note.textContent = '预估失败，不影响使用。'
+    })
+  } finally {
+    _chatSettingsOpening = false
   }
-  const appearance = await db.config.get(`chatAppearance_${chatId}`)
-  const appearanceValue = normalizeChatAppearance(appearance?.value)
-  const stickerCats = await getAllStickerCategories()
-  const mountedStickerIds = await getMountedStickerCatIds(chatId)
-  // 同时拉取每个分组下表情数量，便于在设置页显示
-  const stickerCounts = {}
-  for (const c of stickerCats) {
-    stickerCounts[c.id] = await db.stickers.where('categoryId').equals(c.id).count()
-  }
-  const tzStored = await db.config.get(`chatTimezone_${chatId}`)
-  const tzConfig = tzStored?.value || {}
-  const statusDisplay = await getChatStatusDisplayConfig(chatId)
-  const activeReplySettings = await getChatActiveReplySettings(chatId)
-  const timeSettings = await getChatTimeSettings(chatId)
-  const bilingualSettings = await getChatBilingualSettings(chatId)
-  const imageGenSettings = await getChatImageGenSettings(chatId)
-  const stickerImageInputEnabled = await getChatStickerImageInputEnabled(chatId)
-  const thoughtTemplateStored = await db.config.get(`chatThoughtTemplate_${chatId}`)
-  const thoughtTemplateRaw = thoughtTemplateStored ? thoughtTemplateStored.value || {} : { enabled: true }
-  const thoughtPresets = await getThoughtPresets()
-  const chatBeautyRaw = (await db.config.get(`chatBeauty_${chatId}`))?.value || {}
-  const chatBeautyPresets = await getChatBeautyPresets()
-  const longMemorySettings = window.WanWanMemory?.getSettings
-    ? await window.WanWanMemory.getSettings(chatId)
-    : { enabled: true, summarizeEvery: 30, injectLimit: 12, embeddingEnabled: false, decayStrength: 'medium' }
-  const longMemoryCount = db.memories
-    ? await db.memories.where('chatId').equals(chatId).filter(m => m.ownerUid === _wechatUid && m.charId === charId).count()
-    : 0
-  const promptEstimate = await estimateWechatPromptContext(chatId, charId, _wechatUid, historyLimit)
-  const voiceIdStored = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdStored?.value || ''
-  const msgNotify = await getChatMsgNotifySettings(chatId)
-  settingsPage.innerHTML = buildChatSettingsHTML(
-    char, profile, historyLimit,
-    lorebooks, mountedIds, appearanceValue,
-    stickerCats, mountedStickerIds, stickerCounts, tzConfig, statusDisplay, timeSettings, thoughtTemplateRaw, thoughtPresets,
-    activeReplySettings,
-    bilingualSettings, imageGenSettings, stickerImageInputEnabled,
-    chatBeautyRaw, chatBeautyPresets,
-    longMemorySettings, longMemoryCount,
-    promptEstimate,
-    voiceId, msgNotify
-  )
-  window.openPage(settingsPage)
-  bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char)
 }
 
 // 聊天设置HTML
@@ -16473,6 +17385,25 @@ function buildVoiceIdSectionHTML(voiceId) {
       <div class="cs-section-sub">填入 Voice ID，角色语音消息将用 Minimax TTS 生成</div>
       <input class="input-field" id="cs-voice-id" placeholder="输入 Minimax Voice ID" value="${wcEscHtml(voiceId || '')}" style="margin:0 0 8px">
     </div>
+    <div class="cs-section" data-cs-tab="role">
+      <div class="cs-section-label">Fish Audio 音色</div>
+      <div class="cs-section-sub">在「设置 → Fish Audio 语音配置」里把当前语音服务切到 Fish Audio 后生效</div>
+      <input class="input-field" id="cs-fish-voice-id" placeholder="输入或在下方搜索选择 Fish 音色 ID" value="" style="margin:0 0 8px">
+      <div class="cs-fish-row">
+        <input class="input-field" id="cs-fish-search-input" placeholder="搜索音色名称，如：温柔 / 少年" style="margin:0">
+        <button type="button" class="cs-fish-btn" id="cs-fish-search-btn">搜索</button>
+      </div>
+      <div class="cs-fish-row">
+        <select class="input-field" id="cs-fish-lang" style="margin:0">
+          <option value="">全部语言</option>
+          <option value="zh" selected>中文</option>
+          <option value="en">English</option>
+          <option value="ja">日本語</option>
+        </select>
+        <button type="button" class="cs-fish-btn" id="cs-fish-mine-btn">我的音色</button>
+      </div>
+      <div class="cs-fish-results" id="cs-fish-results"></div>
+    </div>
   `
 }
 
@@ -16481,6 +17412,10 @@ function buildChatHistorySectionHTML() {
   return `
     <div class="cs-section" data-cs-tab="role">
       <div class="cs-section-label">聊天记录</div>
+      <button class="cs-action-row" id="btn-search-chat">
+        <i class="fa fa-magnifying-glass"></i><span>查找聊天记录</span>
+        <i class="fa fa-angle-right cs-arrow"></i>
+      </button>
       <button class="cs-action-row" id="btn-export-chat">
         <i class="fa fa-download"></i><span>导出聊天记录</span>
         <i class="fa fa-angle-right cs-arrow"></i>
@@ -16530,6 +17465,13 @@ function bindChatSettingsEvents(settingsPage, chatId, charId, chatPage, char) {
   bindTimezoneEvents(settingsPage, chatId)
   bindStickerSettingEvents(settingsPage, chatId, chatPage)
   bindVoiceIdEvents(settingsPage, chatId)
+  settingsPage.querySelector('#btn-search-chat')?.addEventListener('click', () => {
+    if (settingsPage.dataset.csDirty === '1') {
+      window.toast?.('设置有未保存的修改，请先保存或返回后再查找')
+      return
+    }
+    openChatHistorySearch(chatPage, chatId, charId, settingsPage)
+  })
   settingsPage.querySelector('#btn-export-chat').addEventListener('click', () => exportChat(chatId, charId, char))
   bindImportChat(settingsPage, chatId, chatPage)
   settingsPage.querySelector('#btn-clear-chat').addEventListener('click', () => clearChatConfirm(chatId, char, chatPage))
@@ -16878,6 +17820,10 @@ async function saveChatSettingsPage(settingsPage, chatId, charId, chatPage, char
 
     const voiceId = settingsPage.querySelector('#cs-voice-id')?.value.trim() || ''
     await db.config.put({ key: `chatVoiceId_${chatId}`, value: voiceId })
+    const fishVoiceEl = settingsPage.querySelector('#cs-fish-voice-id')
+    if (fishVoiceEl && fishVoiceEl.dataset.loaded === '1') {
+      await db.config.put({ key: `chatFishVoiceId_${chatId}`, value: fishVoiceEl.value.trim() })
+    }
 
     settingsPage.dataset.csOriginalAvatarSize = String(appearanceValue.avatarSize)
     settingsPage.dataset.csOriginalAvatarRadius = String(appearanceValue.avatarRadius)
@@ -17868,12 +18814,72 @@ function openChatBeautyEditor(listPage, preset) {
 
 // ===== 表情包库（全局共享） =====
 // 数据访问辅助
+// 表情/分组排序：优先用 sortOrder，没有就按 id（旧数据保持原顺序）
+function stickerOrderKey(x) {
+  return Number.isFinite(x?.sortOrder) ? x.sortOrder : (Number(x?.id) || 0)
+}
+function sortByStickerOrder(list) {
+  return (list || []).slice().sort((a, b) => stickerOrderKey(a) - stickerOrderKey(b) || (a.id - b.id))
+}
+
 async function getAllStickerCategories() {
-  return await db.stickerCategories.orderBy('id').toArray()
+  return sortByStickerOrder(await db.stickerCategories.orderBy('id').toArray())
 }
 
 async function getStickersInCategory(catId) {
-  return await db.stickers.where('categoryId').equals(catId).toArray()
+  return sortByStickerOrder(await db.stickers.where('categoryId').equals(catId).toArray())
+}
+
+// 返回「放到该分组最前面 count 个」时的起始排序值
+async function getStickerFrontStart(catId, count) {
+  let min = 0
+  let has = false
+  await db.stickers.where('categoryId').equals(catId).each(s => {
+    const k = stickerOrderKey(s)
+    if (!has || k < min) { min = k; has = true }
+  })
+  return min - Math.max(1, count || 1)
+}
+
+// 把一个表情移到所在分组最前，返回新排序值
+async function moveStickerToFront(stickerId) {
+  const s = await db.stickers.get(stickerId)
+  if (!s) throw new Error('表情不存在')
+  const key = await getStickerFrontStart(s.categoryId, 1)
+  await db.stickers.update(stickerId, { sortOrder: key })
+  return key
+}
+
+// 按格子当前的显示顺序保存排序（只写有变化的，避免重写大量 base64 图片）
+async function persistStickerOrder(container) {
+  const ids = [...container.querySelectorAll('.sl-tile[data-id]')].map(el => parseInt(el.dataset.id))
+  const keys = container._slKeys || (container._slKeys = {})
+  for (let i = 0; i < ids.length; i++) {
+    if (keys[ids[i]] === i) continue
+    await db.stickers.update(ids[i], { sortOrder: i })
+    keys[ids[i]] = i
+  }
+}
+
+// 分组左移 / 右移 / 移到最前
+async function moveStickerCategory(catId, action, page) {
+  const cats = await getAllStickerCategories()
+  const from = cats.findIndex(c => c.id === catId)
+  if (from < 0) return
+  let to = from
+  if (action === 'left') to = from - 1
+  else if (action === 'right') to = from + 1
+  else if (action === 'front') to = 0
+  if (to < 0 || to >= cats.length || to === from) {
+    window.toast?.(action === 'right' ? '已经是最后一个了' : '已经是第一个了')
+    return
+  }
+  const [moved] = cats.splice(from, 1)
+  cats.splice(to, 0, moved)
+  for (let i = 0; i < cats.length; i++) {
+    if (stickerOrderKey(cats[i]) !== i) await db.stickerCategories.update(cats[i].id, { sortOrder: i })
+  }
+  if (page) await renderStickerLibraryPage(page)
 }
 
 async function getAllStickers() {
@@ -17964,7 +18970,20 @@ async function openStickerLibraryPage() {
     <div class="sl-content" id="sl-content"></div>
   `
   window.openPage(page)
-  page.querySelector('#btn-sl-back').addEventListener('click', () => window.closePage('sticker-library-page'))
+    page.querySelector('#btn-sl-back').addEventListener('click', () => window.closePage('sticker-library-page'))
+  // 排序模式：先点要移动的表情，再点要放在它前面的表情（点最后的「添加」格子 = 放到最后）
+  page.querySelector('#btn-sl-add-cat').insertAdjacentHTML('beforebegin',
+    '<button class="btn-icon" id="btn-sl-sort" title="排序"><i class="fa-solid fa-sort"></i></button>')
+  page.querySelector('.page-header').insertAdjacentHTML('afterend',
+    '<div class="sl-sort-hint" id="sl-sort-hint" style="display:none">排序模式：先点要移动的表情，再点要放在它前面的表情；点最后的“添加”格子＝放到最后。长按表情可“移到最前”，长按分组可调整分组顺序。</div>')
+  page.querySelector('#btn-sl-sort').addEventListener('click', () => {
+    const on = !page.classList.contains('sl-sorting')
+    page.classList.toggle('sl-sorting', on)
+    page._slPickId = null
+    page.querySelectorAll('.sl-tile.sl-picked').forEach(t => t.classList.remove('sl-picked'))
+    page.querySelector('#sl-sort-hint').style.display = on ? '' : 'none'
+    page.querySelector('#btn-sl-sort').classList.toggle('active', on)
+  })
   page.querySelector('#btn-sl-add-cat').addEventListener('click', () => promptAddStickerCategory(page))
   page.querySelector('#btn-sl-add-sticker').addEventListener('click', () => {
     const catId = parseInt(page.dataset.activeCat)
@@ -18034,6 +19053,9 @@ async function renderStickerLibraryPage(page) {
 
 async function renderStickerGrid(container, catId, page) {
   const stickers = await getStickersInCategory(catId)
+  container._slKeys = {}
+  stickers.forEach(s => { container._slKeys[s.id] = stickerOrderKey(s) })
+  if (page) page._slPickId = null
   const tiles = stickers.map(s => `
     <div class="sl-tile" data-id="${s.id}">
       <img src="${s.image}" alt="${wcEscHtml(s.name)}" loading="lazy">
@@ -18049,7 +19071,18 @@ async function renderStickerGrid(container, catId, page) {
       </button>
     </div>
   `
-  container.querySelector('#sl-add-tile').addEventListener('click', () => {
+    container.querySelector('#sl-add-tile').addEventListener('click', async () => {
+    if (page?.classList.contains('sl-sorting') && page._slPickId) {
+      // 排序模式下已选中某个表情：放到最后
+      const picked = container.querySelector(`.sl-tile[data-id="${page._slPickId}"]`)
+      page._slPickId = null
+      if (picked) {
+        picked.classList.remove('sl-picked')
+        container.querySelector('.sl-grid').insertBefore(picked, container.querySelector('#sl-add-tile'))
+        try { await persistStickerOrder(container) } catch (e) { window.toast('排序保存失败，请重试') }
+      }
+      return
+    }
     openStickerImportDialog(catId, () => renderStickerLibraryPage(page))
   })
   container.querySelectorAll('.sl-tile[data-id]').forEach(tile => {
@@ -18075,6 +19108,18 @@ async function renderStickerGrid(container, catId, page) {
       e.preventDefault()
       e.stopPropagation()
     }, true)
+    // 排序模式：点选 → 再点目标，把选中的插到目标前面
+    tile.addEventListener('click', async e => {
+      if (e.defaultPrevented || !page?.classList.contains('sl-sorting')) return
+      const pickedId = page._slPickId
+      if (!pickedId) { page._slPickId = tile.dataset.id; tile.classList.add('sl-picked'); return }
+      const picked = container.querySelector(`.sl-tile[data-id="${pickedId}"]`)
+      page._slPickId = null
+      container.querySelectorAll('.sl-tile.sl-picked').forEach(t => t.classList.remove('sl-picked'))
+      if (!picked || picked === tile) return
+      tile.parentElement.insertBefore(picked, tile)
+      try { await persistStickerOrder(container) } catch (err) { window.toast('排序保存失败，请重试') }
+    })
   })
 }
 
@@ -18118,6 +19163,9 @@ function showCategoryMenu(catId, anchorEl, page) {
   menu.id = 'msg-menu'
   menu.className = 'msg-context-menu'
   menu.innerHTML = `
+    <button data-action="left"><i class="fa fa-arrow-left"></i> 向前移一位</button>
+    <button data-action="right"><i class="fa fa-arrow-right"></i> 向后移一位</button>
+    <button data-action="front"><i class="fa fa-arrow-up"></i> 移到最前</button>
     <button data-action="rename"><i class="fa fa-pencil"></i> 重命名</button>
     <button data-action="delete"><i class="fa fa-trash"></i> 删除分组</button>
   `
@@ -18128,6 +19176,9 @@ function showCategoryMenu(catId, anchorEl, page) {
       menu.remove()
       const action = btn.dataset.action
       if (action === 'rename') promptRenameStickerCategory(catId, page)
+      if (action === 'left' || action === 'right' || action === 'front') {
+        try { await moveStickerCategory(catId, action, page) } catch (e) { window.toast('操作失败，请重试') }
+      }
       if (action === 'delete') confirmDeleteStickerCategory(catId, page)
     })
   })
@@ -18204,6 +19255,7 @@ function showStickerMenu(stickerId, anchorEl, page) {
   menu.id = 'msg-menu'
   menu.className = 'msg-context-menu'
   menu.innerHTML = `
+    <button data-action="front"><i class="fa fa-arrow-up"></i> 移到最前</button>
     <button data-action="rename"><i class="fa fa-pencil"></i> 重命名</button>
     <button data-action="move"><i class="fa fa-folder-open"></i> 移动到</button>
     <button data-action="delete"><i class="fa fa-trash"></i> 删除</button>
@@ -18216,6 +19268,18 @@ function showStickerMenu(stickerId, anchorEl, page) {
       const action = btn.dataset.action
       if (action === 'rename') promptRenameSticker(stickerId, page)
       if (action === 'move') promptMoveSticker(stickerId, page)
+      if (action === 'front') {
+        try {
+          const key = await moveStickerToFront(stickerId)
+          const contentEl = page?.querySelector('#sl-content')
+          const tile = page?.querySelector(`.sl-tile[data-id="${stickerId}"]`)
+          if (tile?.parentElement) tile.parentElement.insertBefore(tile, tile.parentElement.firstElementChild)
+          if (contentEl?._slKeys) contentEl._slKeys[stickerId] = key
+          window.toast('已移到最前')
+        } catch (e) {
+          window.toast('操作失败，请重试')
+        }
+      }
       if (action === 'delete') {
         try {
           await db.stickers.delete(stickerId)
@@ -18303,7 +19367,8 @@ function promptMoveSticker(stickerId, page) {
       const newCatId = parseInt(checked.value)
       if (newCatId === s.categoryId) { closeWcSheet(sheet); return }
       try {
-        await db.stickers.update(stickerId, { categoryId: newCatId })
+        const frontStart = await getStickerFrontStart(newCatId, 1)
+        await db.stickers.update(stickerId, { categoryId: newCatId, sortOrder: frontStart })
       } catch (e) {
         window.toast('移动失败，请刷新页面重试')
         return
@@ -18426,11 +19491,14 @@ function bindStickerImportDialog(sheet, onDone) {
     }
     const catId = parseInt(sheet.querySelector('#si-cat-select').value)
     const now = Date.now()
+    // 新导入的表情排在该分组最前面（同一批保持导入顺序）
+    const frontStart = await getStickerFrontStart(catId, pendingItems.length)
     await db.stickers.bulkAdd(pendingItems.map((it, i) => ({
       categoryId: catId,
       name: String(it.name || '').trim().slice(0, 20),
       image: it.image,
-      createdAt: now + i
+      createdAt: now + i,
+      sortOrder: frontStart + i
     })))
     closeWcSheet(sheet)
     window.toast(`已导入 ${pendingItems.length} 个表情包`)
@@ -18592,6 +19660,128 @@ function showApiErrorModal(message, diagnostic) {
 // ===== Voice ID 设置事件绑定 =====
 function bindVoiceIdEvents(settingsPage, chatId) {
   // Voice ID 由聊天设置顶栏的统一保存按钮保存。
+  const fishInput = settingsPage.querySelector('#cs-fish-voice-id')
+  const resultsEl = settingsPage.querySelector('#cs-fish-results')
+  if (!fishInput || !resultsEl) return
+
+  db.config.get(`chatFishVoiceId_${chatId}`).then(r => {
+    fishInput.value = r?.value || ''
+    fishInput.dataset.loaded = '1'
+  })
+
+  const searchInput = settingsPage.querySelector('#cs-fish-search-input')
+  const langSelect = settingsPage.querySelector('#cs-fish-lang')
+  const searchBtn = settingsPage.querySelector('#cs-fish-search-btn')
+  const mineBtn = settingsPage.querySelector('#cs-fish-mine-btn')
+  const toast = (t) => window.toast && window.toast(t)
+  const state = { self: false, title: '', language: '', page: 1, total: 0, loading: false, items: new Map() }
+  let previewAudio = null
+  let previewBtn = null
+
+  function stopPreview() {
+    if (previewAudio) { previewAudio.pause(); previewAudio = null }
+    if (previewBtn) { previewBtn.textContent = '试听'; previewBtn = null }
+  }
+
+  function renderItems(items, append) {
+    if (!append) resultsEl.innerHTML = ''
+    items.forEach(it => {
+      state.items.set(it._id, it)
+      const langs = Array.isArray(it.languages) ? it.languages.join('/') : ''
+      const author = it.author?.nickname || ''
+      const meta = [langs, author].filter(Boolean).join(' · ')
+      const hasSample = !!it.samples?.[0]?.audio
+      const row = document.createElement('div')
+      row.className = 'cs-fish-item' + (it._id === fishInput.value.trim() ? ' is-selected' : '')
+      row.dataset.id = it._id
+      row.innerHTML = `
+        <div class="cs-fish-info">
+          <div class="cs-fish-title">${wcEscHtml(it.title || '未命名')}</div>
+          <div class="cs-fish-meta">${wcEscHtml(meta)}</div>
+        </div>
+        ${hasSample ? '<button type="button" class="cs-fish-btn cs-fish-play">试听</button>' : ''}
+        <button type="button" class="cs-fish-btn cs-fish-pick">选用</button>
+      `
+      resultsEl.appendChild(row)
+    })
+    const oldMore = resultsEl.querySelector('.cs-fish-more')
+    if (oldMore) oldMore.remove()
+    if (state.items.size < state.total) {
+      const more = document.createElement('button')
+      more.type = 'button'
+      more.className = 'cs-fish-btn cs-fish-more'
+      more.textContent = '加载更多'
+      resultsEl.appendChild(more)
+    }
+    if (!state.items.size) {
+      resultsEl.innerHTML = '<div class="cs-fish-empty">没有找到音色</div>'
+    }
+  }
+
+  async function loadVoices(reset) {
+    if (state.loading) return
+    state.loading = true
+    if (reset) {
+      state.page = 1
+      state.items = new Map()
+      resultsEl.innerHTML = '<div class="cs-fish-empty">加载中…</div>'
+    } else {
+      state.page += 1
+    }
+    try {
+      const data = await fishListVoices({
+        title: state.title, language: state.language, self: state.self, pageNumber: state.page, pageSize: 10
+      })
+      state.total = data.total || 0
+      renderItems(data.items || [], !reset)
+    } catch (e) {
+      if (!reset) state.page -= 1
+      resultsEl.innerHTML = `<div class="cs-fish-empty">${wcEscHtml(e.message || String(e))}</div>`
+    } finally {
+      state.loading = false
+    }
+  }
+
+  function startSearch(self) {
+    stopPreview()
+    state.self = self
+    state.title = self ? '' : (searchInput.value || '').trim()
+    state.language = self ? '' : (langSelect.value || '')
+    loadVoices(true)
+  }
+
+  searchBtn.addEventListener('click', () => startSearch(false))
+  mineBtn.addEventListener('click', () => startSearch(true))
+  searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); startSearch(false) } })
+
+  resultsEl.addEventListener('click', e => {
+    const btn = e.target.closest('button')
+    if (!btn) return
+    if (btn.classList.contains('cs-fish-more')) { loadVoices(false); return }
+    const row = btn.closest('.cs-fish-item')
+    const item = row && state.items.get(row.dataset.id)
+    if (!item) return
+    if (btn.classList.contains('cs-fish-pick')) {
+      fishInput.value = item._id
+      resultsEl.querySelectorAll('.cs-fish-item').forEach(el => el.classList.toggle('is-selected', el === row))
+      markChatSettingsDirty(settingsPage)
+      toast('已填入音色，记得点右上角保存')
+      return
+    }
+    if (btn.classList.contains('cs-fish-play')) {
+      const wasThis = previewBtn === btn
+      stopPreview()
+      if (wasThis) return
+      const url = item.samples?.[0]?.audio
+      if (!url) return
+      previewAudio = new Audio(url)
+      previewBtn = btn
+      btn.textContent = '停止'
+      previewAudio.addEventListener('ended', stopPreview)
+      previewAudio.addEventListener('error', () => { stopPreview(); toast('试听加载失败') })
+      previewAudio.play().catch(() => { stopPreview(); toast('试听播放失败') })
+    }
+  })
 }
 
 // ===== Minimax TTS 调用 =====
@@ -18670,6 +19860,451 @@ async function callMinimaxTTS(text, voiceId) {
   return URL.createObjectURL(blob)
 }
 
+// ===== Fish Audio TTS =====
+async function getTTSProvider() {
+  const r = await db.config.get('ttsProvider')
+  return r?.value === 'fish' ? 'fish' : 'minimax'
+}
+
+// 按当前语音服务取该聊天的音色 ID（Minimax 和 Fish 的音色 ID 分开存）
+async function getChatVoiceId(chatId) {
+  const provider = await getTTSProvider()
+  const r = await db.config.get(provider === 'fish' ? `chatFishVoiceId_${chatId}` : `chatVoiceId_${chatId}`)
+  return r?.value || ''
+}
+
+async function getFishConfig() {
+  const results = await Promise.all([
+    db.config.get('fishBaseUrl'),
+    db.config.get('fishApiKey'),
+    db.config.get('fishModel')
+  ])
+  return {
+    base: (results[0]?.value || 'https://api.fish.audio').replace(/\/+$/, ''),
+    apiKey: results[1]?.value || '',
+    model: results[2]?.value || ''
+  }
+}
+
+async function fishRequest(cfg, path, init) {
+  let res
+  try {
+    res = await fetch(cfg.base + path, init)
+  } catch (e) {
+    throw new Error('无法连接 Fish Audio：可能没开 VPN，或浏览器被跨域（CORS）拦截。' + (e.message ? '（' + e.message + '）' : ''))
+  }
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const j = await res.json()
+      detail = j?.message || j?.error?.message || (Array.isArray(j) ? JSON.stringify(j[0]?.msg || j[0]) : '')
+    } catch (_) {}
+    const hint = res.status === 401 ? '（API Key 不对）' : res.status === 402 ? '（余额/额度不足）' : ''
+    throw new Error('Fish Audio HTTP ' + res.status + hint + (detail ? '：' + String(detail).slice(0, 300) : ''))
+  }
+  return res
+}
+
+async function callFishTTS(text, voiceId) {
+  const cfg = await getFishConfig()
+  if (!cfg.apiKey) throw new Error('Fish Audio API Key 未配置，请在设置中填写')
+  if (!cfg.model) throw new Error('Fish Audio 语音模型未选择，请在设置中选择模型')
+  if (!voiceId) throw new Error('Fish 音色 ID 未配置，请在聊天设置中填写')
+
+  console.info('[Fish TTS] 发送文字：', text)
+  const res = await fishRequest(cfg, '/v1/tts', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + cfg.apiKey,
+      'model': cfg.model
+    },
+    body: JSON.stringify({
+      text: text,
+      reference_id: voiceId,
+      format: 'mp3',
+      mp3_bitrate: 128,
+      latency: 'normal'
+    })
+  })
+  const blob = await res.blob()
+  if (!blob.size) throw new Error('Fish Audio 未返回音频数据')
+  return URL.createObjectURL(new Blob([blob], { type: 'audio/mpeg' }))
+}
+
+// 角色在文字里用【中文语气】标语气；Fish 朗读前换成 [中文语气]（S2.1 的标签语法，不会被读出来），Minimax 不支持就直接去掉
+function prepareTTSText(text, provider) {
+  const s = String(text || '')
+  if (provider === 'fish') return s.replace(/【([^】\n]{1,30})】/g, '[$1]')
+  return s.replace(/【[^】\n]{0,30}】/g, '').replace(/[ \t]{2,}/g, ' ').trim()
+}
+
+// ===== 语音持久缓存 =====
+// 以前同一句话每次打开都要重新向 Fish/Minimax 请求（通话记录里的朗读只在“本次打开期间”缓存在内存里）。
+// 现在统一在 callTTS 里按“语音服务 + 音色 + 文字”缓存到浏览器自己的一个小数据库（独立于聊天数据库，
+// 不会进聊天备份、不改表结构），最多留最近 300 句，满了删最旧的。
+// 通话里实时朗读的每一句也会存进来，所以之后在通话记录里点朗读是直接播放，不再重新生成。
+const TTS_CACHE_DB = 'wanwan_tts_cache'
+const TTS_CACHE_STORE = 'audio'
+const TTS_CACHE_MAX = 300
+let _ttsCacheDbPromise = null
+
+function ttsCacheOpen() {
+  if (_ttsCacheDbPromise) return _ttsCacheDbPromise
+  _ttsCacheDbPromise = new Promise(resolve => {
+    try {
+      const req = indexedDB.open(TTS_CACHE_DB, 1)
+      req.onupgradeneeded = () => {
+        const s = req.result.createObjectStore(TTS_CACHE_STORE, { keyPath: 'key' })
+        s.createIndex('at', 'at')
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => resolve(null)
+      req.onblocked = () => resolve(null)
+    } catch (_) { resolve(null) }
+  })
+  return _ttsCacheDbPromise
+}
+
+function ttsCacheKey(provider, voiceId, text) { return provider + '|' + voiceId + '|' + text }
+
+async function ttsCacheGet(key) {
+  const d = await ttsCacheOpen()
+  if (!d) return null
+  return new Promise(resolve => {
+    try {
+      const rq = d.transaction(TTS_CACHE_STORE).objectStore(TTS_CACHE_STORE).get(key)
+      rq.onsuccess = () => resolve((rq.result && rq.result.blob) || null)
+      rq.onerror = () => resolve(null)
+    } catch (_) { resolve(null) }
+  })
+}
+
+async function ttsCachePut(key, blob) {
+  const d = await ttsCacheOpen()
+  if (!d) return
+  try {
+    await new Promise(resolve => {
+      const tx = d.transaction(TTS_CACHE_STORE, 'readwrite')
+      tx.objectStore(TTS_CACHE_STORE).put({ key, blob, at: Date.now() })
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+      tx.onabort = resolve
+    })
+    await new Promise(resolve => {
+      const tx = d.transaction(TTS_CACHE_STORE, 'readwrite')
+      const st = tx.objectStore(TTS_CACHE_STORE)
+      const cr = st.count()
+      cr.onsuccess = () => {
+        let over = cr.result - TTS_CACHE_MAX
+        if (over <= 0) return
+        const cur = st.index('at').openCursor()
+        cur.onsuccess = () => {
+          const c = cur.result
+          if (c && over-- > 0) { c.delete(); c.continue() }
+        }
+      }
+      tx.oncomplete = resolve
+      tx.onerror = resolve
+      tx.onabort = resolve
+    })
+  } catch (_) {}
+}
+
+// 统一入口：按当前语音服务生成语音，返回 blob 地址（先查本地缓存，没有才请求）
+async function callTTS(text, voiceId) {
+  const provider = await getTTSProvider()
+  const prepared = prepareTTSText(text, provider)
+  if (!prepared) throw new Error('没有可朗读的文字')
+  const key = ttsCacheKey(provider, voiceId, prepared)
+  const hit = await ttsCacheGet(key)
+  if (hit && hit.size) return URL.createObjectURL(hit)
+  const url = provider === 'fish' ? await callFishTTS(prepared, voiceId) : await callMinimaxTTS(prepared, voiceId)
+  try {
+    const blob = await (await fetch(url)).blob()
+    if (blob.size) ttsCachePut(key, blob)
+  } catch (_) {}
+  return url
+}
+
+// 让角色在语音文字里写语气标签的提示词；只有当前语音服务是 Fish 时才加
+// 想改成英文标签：把下面 TTS_TAG_EXAMPLES 换成 【whispering】【laughing】【sighing】 之类，并改"2-6 个字"那句
+const TTS_TAG_EMOTION_HINTS = '开心：【带着笑意，语调上扬】；温柔：【轻柔缓慢，气息贴近】；难过：【气声，拖着尾音】；哽咽：【声音发颤，带着鼻音】；生气：【压低声音，克制地】；烦躁：【短促，不耐烦地叹气】；惊讶：【吸气，惊讶地】；紧张：【急促，声音发颤】；害羞：【小声，有点结巴】'
+const TTS_TAG_EXAMPLES = '【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【生气】【哽咽】【停顿】'
+// 课表上下文（来自设置里导入的 ICS，只放今天，18:00 后加明天）
+async function getScheduleContext() {
+  try {
+    if (window.ScheduleCtx && typeof window.ScheduleCtx.build === 'function') return await window.ScheduleCtx.build()
+  } catch (_) {}
+  return ''
+}
+
+// ===== 角色日程：角色在聊天里说过的安排（上班、执飞、开会……）=====
+// 思路：角色回复时顺带输出 event（开始多久后、持续多久），代码换算成具体的开始/结束时间并存起来；
+// 之后聊天、通话里都会带上这份日程，主动回复也会看它：忙的时候不打扰，到点还没报平安就提醒他。
+// 相对时间不入库：只存换算后的具体时间；时长缺失或不合理的直接丢弃，不猜。
+const CHAR_SCHEDULE_KEY = 'charSchedule'
+
+async function charScheduleLoad() {
+  try {
+    const rec = await db.config.get(CHAR_SCHEDULE_KEY)
+    const v = rec && rec.value
+    return (v && Array.isArray(v.events)) ? v : { events: [] }
+  } catch (_) { return { events: [] } }
+}
+
+async function charScheduleSave(data) {
+  const cutoff = Date.now() - 3 * 86400000
+  data.events = (data.events || []).filter(e => e && e.endAt > cutoff).slice(-60)
+  try { await db.config.put({ key: CHAR_SCHEDULE_KEY, value: data }) } catch (e) { console.warn('[wechat] 保存角色日程失败', e) }
+}
+
+// upcoming 稍后 / active 进行中 / overdue 已过预计结束但没确认 / done 已结束
+function charEventPhase(ev, now = Date.now()) {
+  if (ev.status === 'done' || ev.status === 'cancelled') return 'done'
+  if (now < ev.startAt) return 'upcoming'
+  if (now < ev.endAt) return 'active'
+  return 'overdue'
+}
+
+async function applyCharScheduleFromReply(chatId, charId, result) {
+  try {
+    if (!result) return
+    const wantsDone = result.eventDone === true
+    const ev = result.event
+    if (!wantsDone && !ev) return
+    const now = Date.now()
+    const data = await charScheduleLoad()
+    let changed = false
+    if (wantsDone) {
+      data.events.forEach(e => {
+        if (String(e.chatId) !== String(chatId)) return
+        const ph = charEventPhase(e, now)
+        if (ph === 'active' || ph === 'overdue') { e.status = 'done'; e.doneAt = now; changed = true }
+      })
+    }
+    if (ev && typeof ev === 'object') {
+      const title = String(ev.title || '').trim().slice(0, 20)
+      const startIn = ev.start_in_minutes == null ? 0 : Number(ev.start_in_minutes)
+      const dur = Number(ev.duration_minutes)
+      if (title && Number.isFinite(startIn) && startIn >= 0 && startIn <= 4320 && Number.isFinite(dur) && dur >= 5 && dur <= 4320) {
+        const startAt = now + Math.round(startIn) * 60000
+        const endAt = startAt + Math.round(dur) * 60000
+        const same = data.events.find(e => String(e.chatId) === String(chatId) && e.title === title &&
+          e.status !== 'done' && e.status !== 'cancelled' && Math.abs(e.startAt - startAt) < 60 * 60000)
+        if (same) { same.startAt = startAt; same.endAt = endAt; same.sourceAt = now; delete same.notifiedAt }
+        else data.events.push({
+          id: 'ce_' + now + '_' + Math.random().toString(36).slice(2, 6),
+          chatId, charId, title, sourceAt: now, startAt, endAt, status: 'active'
+        })
+        changed = true
+      }
+    }
+    if (changed) await charScheduleSave(data)
+  } catch (e) { console.warn('[wechat] 登记角色日程失败', e) }
+}
+
+async function getCharScheduleState(chatId) {
+  const data = await charScheduleLoad()
+  const now = Date.now()
+  const mine = data.events.filter(e => String(e.chatId) === String(chatId))
+  return {
+    data,
+    active: mine.find(e => charEventPhase(e, now) === 'active') || null,
+    overdue: mine.filter(e => charEventPhase(e, now) === 'overdue' && now - e.endAt < 12 * 3600000)
+      .sort((a, b) => b.endAt - a.endAt)[0] || null
+  }
+}
+
+async function getCharScheduleContext(chatId, charName) {
+  try {
+    if (chatId == null) return ''
+    const data = await charScheduleLoad()
+    const now = Date.now()
+    const list = data.events
+      .filter(e => String(e.chatId) === String(chatId) && charEventPhase(e, now) !== 'done' &&
+        e.endAt > now - 12 * 3600000 && e.startAt < now + 48 * 3600000)
+      .sort((a, b) => a.startAt - b.startAt)
+    if (!list.length) return ''
+    const fmt = ts => formatWechatFullDateTime(ts)
+    const span = ms => ms >= 3600000 ? `${(ms / 3600000).toFixed(1).replace(/\.0$/, '')}小时` : `${Math.max(1, Math.round(ms / 60000))}分钟`
+    const lines = list.map(e => {
+      const ph = charEventPhase(e, now)
+      if (ph === 'upcoming') return `- 稍后：${e.title}，${fmt(e.startAt)} 开始，预计 ${fmt(e.endAt)} 结束`
+      if (ph === 'active') return `- 进行中：${e.title}，${fmt(e.startAt)} 开始，预计 ${fmt(e.endAt)} 结束（已进行 ${span(now - e.startAt)}，还剩约 ${span(e.endAt - now)}）`
+      return `- 已过预计结束时间：${e.title}，预计 ${fmt(e.endAt)} 结束，已超过 ${span(now - e.endAt)}，还没有确认结束${e.notifiedAt ? '（已提醒过一次）' : ''}`
+    })
+    return `【${charName || '你'}的日程（来自聊天里你自己说过的安排，必须和聊天内容保持一致）】\n现在：${fmt(now)}\n${lines.join('\n')}\n使用方式：\n- “进行中”的事就是你此刻真实的处境。按这件事的性质决定你能不能看手机、能回多少：比如飞行中、手术、开会时不能或很难回复；通勤、休息间隙可以简短回几句。如果选择回复，要符合处境，不要突然表现得很闲。\n- “已过预计结束时间”的事说明你应该已经忙完了：如果还没跟对方说过，这次就自然地说一声（落地平安、下班了、开完会了），并在 JSON 里写 "event_done": true。\n- 事情有变化（延误、提前结束、改期）以你在聊天里说的为准，并重新登记 event。\n- 不要凭空编造和这份日程矛盾的安排，也不要每句话都提日程。`
+  } catch (e) { return '' }
+}
+
+// 主动回复“抽状态”的额外几项（概率都在这里，想调就改数字）
+const IMPULSE_P = {
+  dream: 0.5,       // 今天第一条消息：做梦并描述梦境
+  wantMedia: 0.8,   // 起性欲想要时：发自拍 / 语音
+  wantAsk: 0.3,     // 起性欲想要时：要求对方描述身体与着装状态
+  askPhoto: 2 / 3   // 上面那 30% 里：再附加要求对方拍照
+}
+const IMPULSE_PHOTO_KINDS = ['自拍', '对镜拍（能看到身上穿着）', '拍内裤', '拍大腿', '拍锁骨和肩颈', '拍腰腹']
+
+function buildImpulseExtras(pick, recent, hour) {
+  const parts = []
+  // 一天从凌晨 5 点算起；最后一条消息在今天之前，说明今天还没聊过
+  const d = new Date()
+  if (d.getHours() < 5) d.setDate(d.getDate() - 1)
+  d.setHours(5, 0, 0, 0)
+  const lastTs = Number(recent && recent[0] && recent[0].createdAt) || 0
+  if (lastTs < d.getTime() && Math.random() < IMPULSE_P.dream) {
+    parts.push('# 【今天的第一条消息：做了个梦】\n你今天还没和她说过话，刚睡醒（或刚午睡醒），脑子里还留着一个梦。把这个梦讲给她：具体说梦里的场景、发生了什么、哪些细节很荒诞或很真实，醒来后是什么感觉。梦要符合你的人设和你们的关系，可以和她有关，也可以只是你自己的梦、醒来后想起她。像真人讲梦一样，断断续续、带点没睡醒的口气，不要写成总结，也不要解释为什么要讲梦。')
+  }
+  if (pick === 'want') {
+    const acts = []
+    if (Math.random() < IMPULSE_P.wantMedia) {
+      acts.push(Math.random() < 0.5
+        ? '顺势给她发一张你的自拍（用照片消息格式，独占一行，再配一句话），让她看见此刻的你。'
+        : '顺势给她发一条语音消息（用语音消息格式，独占一行），用说的比打字更贴近、更私密，可以压低声音、带点气息。')
+    }
+    if (Math.random() < IMPULSE_P.wantAsk) {
+      acts.push('也想知道她此刻的状态：请她说说现在的身体和穿着——穿了什么、躺着还是坐着、身体有什么感觉。用你的口吻自然地问出来，别像审问。')
+      if (Math.random() < IMPULSE_P.askPhoto) {
+        const kind = IMPULSE_PHOTO_KINDS[Math.floor(Math.random() * IMPULSE_PHOTO_KINDS.length)]
+        acts.push(`并且想看她：请她发一张${kind}给你看（撒娇、带点占有欲或半命令都可以，取决于你的性格）。`)
+      }
+    }
+    if (acts.length) {
+      parts.push('# 【此刻想亲近她：这次的做法】\n（仅适用于：你们是亲密关系、你和对方都是成年人设定、此刻情境允许。若和上下文冲突——对方在忙、心情不好、刚吵过架、不方便——就忽略这一段，不要硬来；她不愿意就尊重，顺着她的话转开。不要在消息里提到“抽到”“概率”“设定”这类词。）\n' + acts.map(a => '- ' + a).join('\n'))
+    }
+  }
+  return parts.length ? '\n\n' + parts.join('\n\n') : ''
+}
+
+// 主动回复的“此刻心境”：不是纯随机，而是按上下文信号加权后再抽一个倾向，只作为参考交给模型
+async function buildActiveReplyImpulse(chatId, idleMs) {
+  try {
+    const recent = await db.messages.where('chatId').equals(Number(chatId)).reverse().limit(12).toArray()
+    const text = recent.map(m => String(m.content || '')).join('\n')
+    const count = words => words.reduce((n, w) => n + (text.includes(w) ? 1 : 0), 0)
+    const hours = Math.max(0, idleMs / 3600000)
+    const hour = new Date().getHours()
+    const warm = count(['想你', '抱', '亲', '爱你', '贴贴', '宝宝', '乖'])
+    const intimate = count(['床', '摸', '身体', '想要', '做爱', '硬', '湿', '腰', '腿', '吻'])
+    const fight = count(['生气', '别理我', '不想说', '吵架', '分手', '烦死'])
+    const meal = [7, 8, 11, 12, 13, 17, 18, 19].includes(hour)
+    const late = hour >= 23 || hour <= 4
+    const weights = {
+      miss: 1 + Math.min(hours / 1.5, 4) + warm * 0.5 - (fight ? 0.5 : 0),
+      want: 0.4 + intimate * 0.9 + ((late || hour >= 21) ? 0.8 : 0) + (hours >= 3 ? 0.4 : 0) - (fight ? 1 : 0),
+      care: 0.8 + (meal ? 0.8 : 0) + (late ? 0.6 : 0) + (fight ? 1 : 0),
+      share: 1.2 + ((hour >= 9 && hour <= 18) ? 0.6 : 0)
+    }
+    const keys = Object.keys(weights)
+    keys.forEach(k => { weights[k] = Math.max(0.05, weights[k]) })
+    let r = Math.random() * keys.reduce((n, k) => n + weights[k], 0)
+    let pick = keys[0]
+    for (const k of keys) { r -= weights[k]; if (r <= 0) { pick = k; break } }
+    const label = { miss: '想念', want: '想亲近、想要她', care: '惦记她的状态', share: '想分享点什么' }[pick]
+    const guide = {
+      miss: '你此刻心里最强的是想念。直接把想念和爱意说出来：具体想她的哪一点、想起和她在一起时的哪个细节；不要只是问“在干嘛”。',
+      want: '你此刻身体有了反应、想亲近她。按你的人设和你们的关系，坦率说出你想要她、想碰她，具体到你想怎么做、想要什么感觉；不要只发一句很短的话。',
+      care: '你此刻惦记她。要具体到她今天的安排、情绪或你们最近聊到的事；不要只是问“吃了吗”“早点睡”这类模板问候。',
+      share: '你此刻想和她分享你这边刚发生的一件小事，或突然想到的东西；要具体、有画面，别泛泛而谈。'
+    }[pick]
+    const extra = buildImpulseExtras(pick, recent, hour)
+    const hoursText = hours >= 1 ? `${hours.toFixed(1).replace(/\.0$/, '')} 小时` : `${Math.max(1, Math.round(hours * 60))} 分钟`
+    return `# 【此刻的心境倾向】\n离上次聊天已经过去 ${hoursText}，现在是 ${hour} 点。结合你们最近的对话，你此刻心里更偏向：${label}。\n${guide}\n这只是倾向，不是命令：如果和当前上下文冲突（你正在忙、刚吵过架、对方心情不好、对话刚停在某个话题上），以上下文为准，自行调整。不要在消息里提到“倾向”“判断”这类词。${extra}`
+  } catch (e) { return '' }
+}
+
+// 通用：点按钮读一段文字（通话记录用）。同一段文字同一音色在本次打开期间只生成一次
+const _speakOnceCache = new Map()
+let _speakOnceAudio = null
+let _speakOnceBtn = null
+function stopSpeakOnce() {
+  if (_speakOnceAudio) { try { _speakOnceAudio.pause() } catch (_) {} _speakOnceAudio = null }
+  if (_speakOnceBtn) { _speakOnceBtn.classList.remove('is-playing', 'is-loading'); _speakOnceBtn = null }
+}
+async function speakTextOnce(chatId, text, btn) {
+  if (_speakOnceBtn === btn) { stopSpeakOnce(); return }
+  stopSpeakOnce()
+  const audio = new Audio()
+  audio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  audio.play().catch(() => {})
+  _speakOnceAudio = audio
+  _speakOnceBtn = btn
+  btn.classList.add('is-loading')
+  try {
+    const voiceId = await getChatVoiceId(chatId)
+    if (!voiceId) { window.toast?.('这个角色还没设置音色 ID（聊天设置里填）'); stopSpeakOnce(); return }
+    const key = voiceId + '|' + text
+    let url = _speakOnceCache.get(key)
+    if (!url) {
+      url = await callTTS(text, voiceId)
+      _speakOnceCache.set(key, url)
+      if (_speakOnceCache.size > 20) {
+        const oldest = _speakOnceCache.keys().next().value
+        URL.revokeObjectURL(_speakOnceCache.get(oldest))
+        _speakOnceCache.delete(oldest)
+      }
+    }
+    if (_speakOnceBtn !== btn) return
+    btn.classList.remove('is-loading')
+    btn.classList.add('is-playing')
+    audio.src = url
+    audio.addEventListener('ended', () => { if (_speakOnceBtn === btn) stopSpeakOnce() })
+    await audio.play()
+  } catch (e) {
+    stopSpeakOnce()
+    window.toast?.('朗读失败：' + (e.message || e))
+  }
+}
+
+async function isTTSTagEnabled() {
+  return (await getTTSProvider()) === 'fish'
+}
+async function getTTSTagHint(kind, charName) {
+  if (!(await isTTSTagEnabled())) return ''
+  const rules = `- 标签用中文短语，2-10 个字，可参考：${TTS_TAG_EXAMPLES}。
+- 想要听得出区别，就写得具体一点，按当时的情绪选：${TTS_TAG_EMOTION_HINTS}。
+- 标签放在要影响的那句话前面；每句最多 1 个，整段话总共不超过 3 个，不要连续堆叠，没有明显语气变化就不写。
+- 只用【】，不要用其他括号；标签里只写语气或情绪，不要写动作描写或长句。
+- 标签只写在原文语言的部分，译文里不要写标签。`
+  if (kind === 'chat') {
+    return `# 【语音消息的语气标签】
+发语音消息时，可以在语音文字里用【】标出语气或情绪，之后朗读会更有感情。例如：\`[${charName || '角色'}的语音：【轻声】我到家啦，【轻笑】今天好累]\`
+${rules}
+
+---`
+  }
+  if (kind === 'call') {
+    return `【语气标签】
+"speech" 里可以用【】标出语气或情绪，之后朗读会更有感情。例如：{"scene":"...","speech":"【轻笑】喂？怎么啦，【轻声】突然打电话过来"}
+${rules}
+- 标签写在 speech 字符串里即可，JSON 格式保持合法。`
+  }
+  return ''
+}
+
+// 搜索/拉取 Fish 音色。self=true 只拿自己账号下的音色
+async function fishListVoices(opts) {
+  const o = opts || {}
+  const cfg = await getFishConfig()
+  if (!cfg.apiKey) throw new Error('请先在设置里填写 Fish Audio API Key')
+  const params = new URLSearchParams()
+  params.set('page_size', String(o.pageSize || 10))
+  params.set('page_number', String(o.pageNumber || 1))
+  if (o.self) {
+    params.set('self', 'true')
+  } else {
+    params.set('sort_by', 'score')
+    if (o.title) params.set('title', o.title)
+    if (o.language) params.set('language', o.language)
+  }
+  const res = await fishRequest(cfg, '/model?' + params.toString(), {
+    headers: { 'Authorization': 'Bearer ' + cfg.apiKey }
+  })
+  return res.json()
+}
+
 // ===== 语音音频缓存 =====
 var _voiceAudioPlayer = null
 
@@ -18694,6 +20329,52 @@ async function blobUrlToDataUrl(blobUrl) {
 }
 
 // ===== 重写 toggleVoice：点击语音条时触发 TTS =====
+// iPhone 只允许“被手指点触解锁过的 Audio 元素”在异步等待之后继续播放。
+// 以前每次 new Audio() 再 play()，生成语音要等几秒，手势早失效，所以第一次生成完不会自己播，
+// 得关掉再点一次（这时用缓存，不用等）。现在全程复用同一个 Audio 元素：点的瞬间先解锁，
+// 生成完只换 src 再播放。
+var _voiceSharedAudio = null
+var _voicePlayingEl = null
+var _voiceClickSeq = 0
+const VOICE_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+function getVoiceSharedAudio() {
+  if (!_voiceSharedAudio) {
+    _voiceSharedAudio = new Audio()
+    _voiceSharedAudio.preload = 'auto'
+  }
+  return _voiceSharedAudio
+}
+
+// 必须在点击事件里同步调用（前面不能有 await）
+function unlockVoiceAudio() {
+  try {
+    const a = getVoiceSharedAudio()
+    if (a._voiceUnlocked) return
+    a.src = VOICE_SILENT_WAV
+    const p = a.play()
+    if (p && p.then) {
+      p.then(() => {
+        a._voiceUnlocked = true
+        if (String(a.src).startsWith('data:audio/wav')) a.pause()
+      }).catch(() => {})
+    }
+  } catch (_) {}
+}
+
+function stopVoiceAudio() {
+  const a = _voiceSharedAudio
+  if (a) {
+    a.onended = null
+    try { a.pause() } catch (_) {}
+  }
+  _voiceAudioPlayer = null
+  if (_voicePlayingEl) {
+    _voicePlayingEl.classList.remove('is-playing')
+    _voicePlayingEl = null
+  }
+}
+
 window.toggleVoice = async function(bubbleEl) {
   const voice = bubbleEl.closest('.voice-message')
   if (!voice) return
@@ -18704,9 +20385,11 @@ window.toggleVoice = async function(bubbleEl) {
   if (translationEl) translationEl.style.display = isOpen ? 'block' : 'none'
 
   if (!isOpen) {
-    if (_voiceAudioPlayer) { _voiceAudioPlayer.pause(); _voiceAudioPlayer = null }
+    stopVoiceAudio()
     return
   }
+  unlockVoiceAudio()
+  const seq = ++_voiceClickSeq
 
   const msgId = parseInt(voice.dataset.msgId)
   if (!msgId) return
@@ -18715,8 +20398,7 @@ window.toggleVoice = async function(bubbleEl) {
   if (!msg || msg.role !== 'assistant') return
 
   const chatId = msg.chatId
-  const voiceIdCfg = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdCfg?.value
+  const voiceId = await getChatVoiceId(chatId)
   if (!voiceId) return
 
   const cached = msg.voiceAudioData
@@ -18733,11 +20415,12 @@ window.toggleVoice = async function(bubbleEl) {
 
   bubbleEl.classList.add('voice-loading')
   try {
-    const blobUrl = await callMinimaxTTS(voiceText, voiceId)
+    const blobUrl = await callTTS(voiceText, voiceId)
     const dataUrl = await blobUrlToDataUrl(blobUrl)
     URL.revokeObjectURL(blobUrl)
     await saveVoiceAudioCache(msgId, dataUrl)
-    if (voice.classList.contains('is-open')) {
+    // 生成期间如果又关掉了，或者点了别的语音条，就不再自动播放
+    if (voice.classList.contains('is-open') && seq === _voiceClickSeq) {
       playVoiceAudio(dataUrl, voice)
     }
   } catch (e) {
@@ -18748,15 +20431,26 @@ window.toggleVoice = async function(bubbleEl) {
 }
 
 function playVoiceAudio(src, voiceEl) {
-  if (_voiceAudioPlayer) { _voiceAudioPlayer.pause(); _voiceAudioPlayer = null }
-  const audio = new Audio(src)
-  _voiceAudioPlayer = audio
-  audio.play().catch(() => {})
-  audio.addEventListener('ended', () => {
-    _voiceAudioPlayer = null
+  stopVoiceAudio()
+  const a = getVoiceSharedAudio()
+  _voiceAudioPlayer = a
+  a.onended = () => {
+    if (_voiceAudioPlayer === a) _voiceAudioPlayer = null
     if (voiceEl) voiceEl.classList.remove('is-playing')
-  })
+    if (_voicePlayingEl === voiceEl) _voicePlayingEl = null
+  }
+  a.src = src
+  _voicePlayingEl = voiceEl || null
   if (voiceEl) voiceEl.classList.add('is-playing')
+  const p = a.play()
+  if (p && p.catch) {
+    p.catch(e => {
+      console.warn('语音播放失败', e && (e.name || e.message))
+      if (voiceEl) voiceEl.classList.remove('is-playing')
+      if (_voicePlayingEl === voiceEl) _voicePlayingEl = null
+      window.toast?.('语音播放失败，请再点一次')
+    })
+  }
 }
 
 // ===== AI 回复后自动生成语音 =====
@@ -18764,8 +20458,7 @@ async function autoGenerateVoiceIfNeeded(chatId, msgId, content) {
   const parsed = parseMsgType(content)
   if (parsed.type !== 'voice') return
 
-  const voiceIdCfg = await db.config.get(`chatVoiceId_${chatId}`)
-  const voiceId = voiceIdCfg?.value
+  const voiceId = await getChatVoiceId(chatId)
   if (!voiceId) return
 
   const bilingualSettings = await getChatBilingualSettings(chatId)
@@ -18773,11 +20466,13 @@ async function autoGenerateVoiceIfNeeded(chatId, msgId, content) {
   if (!voiceText) return
 
   try {
-    const blobUrl = await callMinimaxTTS(voiceText, voiceId)
+    const blobUrl = await callTTS(voiceText, voiceId)
     const dataUrl = await blobUrlToDataUrl(blobUrl)
     URL.revokeObjectURL(blobUrl)
     await saveVoiceAudioCache(msgId, dataUrl)
-  } catch (_) {}
+  } catch (e) {
+    console.warn('语音自动生成失败', e && e.message)
+  }
 }
 
 // HTML转义
@@ -19409,6 +21104,7 @@ let _callHistory = []
 let _callSystemPrompt = ''
 let _callState = 'idle'
 let _callType = null
+let _callAutoSpeak = true // 通话里角色说话是否自动朗读（默认开，记在 db.config.callAutoSpeak）
 let _callStartTime = null
 let _callTimerInterval = null
 let _callChatId = null
@@ -19421,12 +21117,137 @@ let _callTTSRetryTimer = null
 let _callTTSRequestSeq = 0
 let _callTTSCanceledRetrySeqs = new Set()
 let _callAISending = false
+let _callSessionId = 0 // 每次通话结束 +1，用来作废挂断前遗留的旧请求
+const CALL_AI_TIMEOUT_MS = 45 * 1000
 let _callInitiator = 'user'
 let _realCameraStream = null
 let _realCameraActive = false
 let _realCameraFacingMode = 'user'
 let _callRecognition = null
 let _callRecognitionTimeout = null
+
+// ===== 通话自动保存 / 闲置自动挂断 =====
+// 通话内容原来只在点「挂断」时才写进数据库；现在每条消息都会存一份草稿（db.config 的 callDraft），
+// 清后台/闪退后下次打开会自动补成通话记录。
+const CALL_DRAFT_KEY = 'callDraft'
+const CALL_IDLE_LIMIT_MS = 2 * 60 * 60 * 1000 // 超过这个时间没人说话，自动挂断（改这里的数字即可）
+let _callLastActivity = 0
+let _callIdleTimer = null
+let _callResumeRecordId = null // 正在续接的通话记录 id（有值说明这是一次"回到通话"）
+let _callResumeNote = ''       // 续接后第一次请求 AI 时附带的一句提示，回复成功后清空
+
+async function saveCallDraft() {
+  if (_callState === 'idle' || !_callChatId || !_callStartTime) return
+  try {
+    await db.config.put({
+      key: CALL_DRAFT_KEY,
+      value: {
+        chatId: _callChatId,
+        charId: _callCharId,
+        ownerUid: window._wechatUid,
+        type: _callType || 'voice',
+        resumeRecordId: _callResumeRecordId || undefined,
+        initiator: _callInitiator,
+        startTime: _callStartTime,
+        lastActivity: _callLastActivity || Date.now(),
+        messages: _callHistory.map(m => ({
+          role: m.role,
+          content: m.content,
+          scene: m.scene || undefined,
+          speech: m.speech || undefined,
+          timestamp: m.timestamp || Date.now()
+        }))
+      }
+    })
+  } catch (e) { console.warn('保存通话草稿失败', e) }
+}
+
+async function clearCallDraft() {
+  try { await db.config.delete(CALL_DRAFT_KEY) } catch (_) {}
+}
+
+function stopCallIdleWatch() {
+  if (_callIdleTimer) { clearInterval(_callIdleTimer); _callIdleTimer = null }
+}
+
+function checkCallIdle() {
+  if (_callState !== 'connected' || !_callLastActivity) return
+  if (_callAISending) return
+  if (Date.now() - _callLastActivity < CALL_IDLE_LIMIT_MS) return
+  stopCallIdleWatch()
+  window.toast?.('太久没有说话，通话已自动挂断')
+  // 通话时长只算到最后一次说话的时间
+  endCall({ endAt: _callLastActivity })
+}
+
+function startCallIdleWatch() {
+  if (_callIdleTimer) return
+  _callIdleTimer = setInterval(checkCallIdle, 60 * 1000)
+}
+
+// 上次通话没正常挂断（清后台、闪退）→ 把草稿补成通话记录
+async function recoverCallDraft() {
+  if (_callState !== 'idle') return
+  let draft = null
+  try { draft = (await db.config.get(CALL_DRAFT_KEY))?.value } catch (_) { return }
+  if (!draft || !draft.chatId || !draft.startTime) { if (draft) await clearCallDraft(); return }
+  const msgs = Array.isArray(draft.messages) ? draft.messages : []
+  const endAt = draft.lastActivity || draft.startTime
+  const duration = Math.max(0, Math.floor((endAt - draft.startTime) / 1000))
+  try {
+        if (draft.resumeRecordId) {
+      const merged = duration > 0 && msgs.length && await mergeResumedCall(draft.resumeRecordId, {
+        chatId: draft.chatId, charId: draft.charId, type: draft.type || 'voice',
+        initiator: draft.initiator || 'user', duration, messages: msgs, msgTime: endAt
+      })
+      if (merged) {
+              triggerCallMemory(draft.chatId, draft.charId, draft.ownerUid, callRecordId)
+      window.toast?.('上次没挂断的通话已自动保存')
+        if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
+        await clearCallDraft()
+        return
+      }
+    }
+    const dup = await db.callRecords.where('chatId').equals(draft.chatId)
+      .filter(r => r.createdAt === draft.startTime).count()
+    if (!dup && duration > 0 && msgs.length) {
+      const callRecordId = await db.callRecords.add({
+        chatId: draft.chatId,
+        charId: draft.charId,
+        ownerUid: draft.ownerUid,
+        type: draft.type || 'voice',
+        initiator: draft.initiator || 'user',
+        duration,
+        messages: msgs,
+        createdAt: draft.startTime,
+        recovered: true
+      })
+      const mm = String(Math.floor(duration / 60)).padStart(2, '0')
+      const ss = String(duration % 60).padStart(2, '0')
+      const typeLabel = draft.type === 'video' ? '视频通话' : '语音通话'
+      await addPrivateMessageIdempotently({
+        chatId: draft.chatId,
+        charId: draft.charId,
+        role: draft.initiator === 'char' ? 'assistant' : 'user',
+        content: `[${typeLabel} ${mm}:${ss}]`,
+        callRecordId,
+        createdAt: endAt
+      })
+      window.toast?.('上次没挂断的通话已自动保存')
+      if (typeof refreshVisibleWechatChatList === 'function') refreshVisibleWechatChatList({ showLoading: false })
+    }
+    await clearCallDraft()
+  } catch (e) { console.error('恢复通话草稿失败', e) }
+}
+
+// 回到前台时：先检查是不是闲置超时；页面被杀后重新打开时：补存草稿
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { saveCallDraft(); return }
+  checkCallIdle()
+  recoverCallDraft()
+})
+window.addEventListener('pagehide', () => { saveCallDraft() })
+setTimeout(() => { if (typeof db !== 'undefined' && db?.config) recoverCallDraft() }, 3000)
 let _callMinimized = false
 
 const CALL_TTS_RETRY_DELAY_MS = 3000
@@ -19556,7 +21377,7 @@ function buildCallOutputFormat(callType) {
 - "speech"：你说的话（语音内容），自然口语，像真人通话一样
 
 ✅ 正确示例：{"scene":"房间里很安静，偶尔传来翻书的声音","speech":"喂？怎么啦，突然打电话过来"}
-❌ 错误：好的，我来回复：{"scene":"...","speech":"..."}`
+❌ 错误：好的，我来回复：{"scene":"...","speech":"..."}${window.ProseGuard && window.ProseGuard.isEnabled('wechat') ? '\n\n【文风】\n' + window.ProseGuard.styleRule({ short: true, prefix: '- ' }) : ''}`
 }
 
 // ===== 语音通话专属规则 =====
@@ -19645,6 +21466,12 @@ async function buildVoiceCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'voice', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVoice = await getTTSTagHint('call', charName)
+  if (ttsTagHintVoice) prompt += ttsTagHintVoice + '\n\n'
+  const scheduleCtxVoice = await getScheduleContext()
+  if (scheduleCtxVoice) prompt += scheduleCtxVoice + '\n\n'
+  const charSchedVoice = await getCharScheduleContext(chatId, charName)
+  if (charSchedVoice) prompt += charSchedVoice + '\n\n'
 
   prompt += buildCallOutputFormat('voice') + '\n'
 
@@ -19685,6 +21512,12 @@ async function buildVideoCallSystemPrompt(chatId, charId) {
 
   const bilingualPart = buildCallBilingualPart(bilingualSettings, 'video', charName)
   if (bilingualPart) prompt += bilingualPart + '\n\n'
+  const ttsTagHintVideo = await getTTSTagHint('call', charName)
+  if (ttsTagHintVideo) prompt += ttsTagHintVideo + '\n\n'
+  const scheduleCtxVideo = await getScheduleContext()
+  if (scheduleCtxVideo) prompt += scheduleCtxVideo + '\n\n'
+  const charSchedVideo = await getCharScheduleContext(chatId, charName)
+  if (charSchedVideo) prompt += charSchedVideo + '\n\n'
 
   if (_realCameraActive) {
     prompt += buildRealCameraPart(charName, userName) + '\n\n'
@@ -19825,6 +21658,11 @@ async function startCall(chatId, charId, type, initiator = 'user') {
     return
   }
 
+  try {
+    const autoCfg = await db.config.get('callAutoSpeak')
+    _callAutoSpeak = autoCfg ? autoCfg.value !== false : true
+  } catch (_) { _callAutoSpeak = true }
+
   const page = document.createElement('div')
   page.id = 'call-page'
   page.className = `full-page call-page ${type === 'video' ? 'video-call-page' : 'voice-call-page'}`
@@ -19834,11 +21672,18 @@ async function startCall(chatId, charId, type, initiator = 'user') {
 
   window.openPage(page)
   bindCallEvents(page, type)
-
   try {
-    _callSystemPrompt = type === 'video'
-      ? await buildVideoCallSystemPrompt(chatId, charId)
-      : await buildVoiceCallSystemPrompt(chatId, charId)
+    const bootSession = _callSessionId
+    _callSystemPrompt = ''
+    showCallTypingIndicator(page) // 拨出后立刻出现三点，表示正在等对方
+    updateCallStatus(page, '对方正在接听...')
+    _callSystemPrompt = await withCallTimeout(
+      type === 'video'
+        ? buildVideoCallSystemPrompt(chatId, charId)
+        : buildVoiceCallSystemPrompt(chatId, charId),
+      20000, '准备通话资料超时'
+    )
+    if (bootSession !== _callSessionId) return // 已挂断，不再继续
 
     const userName = window._wechatUser?.name || '用户'
     const helpers = h()
@@ -19858,7 +21703,8 @@ async function startCall(chatId, charId, type, initiator = 'user') {
     dispatchCallStateChange()
     await sendCallAIRequest(page)
   } catch (e) {
-    console.error('通话连接失败', e)
+console.error('通话连接失败', e)
+    page.querySelectorAll('.call-msg-typing').forEach(el => el.remove())
     updateCallStatus(page, '连接失败')
     window.toast?.('通话连接失败：' + (e.message || '未知错误'))
   }
@@ -19868,6 +21714,34 @@ function bindCallEvents(page, type) {
   page.addEventListener('pointerdown', retryPendingCallAudioPlayback)
   page.querySelector('#btn-call-hangup').addEventListener('click', () => endCall())
   page.querySelector('#btn-call-minimize')?.addEventListener('click', () => minimizeCall())
+  // 点通话页任意位置（包括点输入框）都先解锁一次音频，这样回车发送后也能自动朗读
+  page.addEventListener('touchend', unlockCallAudioPlayback, { passive: true })
+  page.addEventListener('click', unlockCallAudioPlayback)
+
+  // 自动朗读开关（右上角）
+  const callContent = page.querySelector('.call-content')
+  if (callContent && !page.querySelector('#btn-call-autospeak')) {
+    const autoBtn = document.createElement('button')
+    autoBtn.type = 'button'
+    autoBtn.id = 'btn-call-autospeak'
+    autoBtn.className = 'call-minimize-btn call-autospeak-btn'
+    const paintAuto = () => {
+      autoBtn.innerHTML = `<i class="fa-solid ${_callAutoSpeak ? 'fa-volume-high' : 'fa-volume-xmark'}"></i>`
+      autoBtn.title = _callAutoSpeak ? '自动朗读：开' : '自动朗读：关'
+    }
+    paintAuto()
+    autoBtn.addEventListener('click', async () => {
+      _callAutoSpeak = !_callAutoSpeak
+      paintAuto()
+      try { await db.config.put({ key: 'callAutoSpeak', value: _callAutoSpeak }) } catch (_) {}
+      if (!_callAutoSpeak) {
+        cancelCallTTSRetry()
+        stopCallAudio()
+      }
+      window.toast?.(_callAutoSpeak ? '自动朗读已开启' : '自动朗读已关闭，可点气泡旁的小喇叭')
+    })
+    callContent.appendChild(autoBtn)
+  }
 
   page.querySelector('#btn-call-mute')?.addEventListener('click', function () {
     this.classList.toggle('active')
@@ -19906,7 +21780,7 @@ function bindCallEvents(page, type) {
 }
 
 function handleCallUserSend(page) {
-  if (_callState !== 'connected') return
+  if (_callState === 'idle') return
   const input = page.querySelector('#call-input')
   const text = input.value.trim()
   if (!text) return
@@ -19915,12 +21789,17 @@ function handleCallUserSend(page) {
   retryPendingCallAudioPlayback()
 
   _callHistory.push({ role: 'user', content: text })
+  _callLastActivity = Date.now()
+  saveCallDraft()
 
   appendCallUserBubble(page, text)
+
+  // 发送后自动请求角色回复（魔法棒按钮保留，用于失败后重试）
+  if (!_callAISending) sendCallAIRequest(page)
 }
 
 async function handleCallReply(page) {
-  if (_callState !== 'connected' || _callAISending) return
+  if (_callState === 'idle' || _callAISending) return
   if (_callHistory.length === 0 || _callHistory[_callHistory.length - 1].role !== 'user') {
     window.toast?.('请先发送消息')
     return
@@ -19939,21 +21818,109 @@ function appendCallUserBubble(page, text) {
   const conversation = page.querySelector('#call-conversation')
   if (conversation) conversation.scrollTop = conversation.scrollHeight
 }
+// 通话里“对方正在回复”的三点跳动占位（样式由 JS 自带，不用改 CSS 文件）
+function ensureCallTypingStyle() {
+  if (document.getElementById('call-typing-style')) return
+  const style = document.createElement('style')
+  style.id = 'call-typing-style'
+  style.textContent = `
+    .call-typing-dots { display: inline-flex; align-items: center; gap: 5px; min-height: 20px; }
+    .call-typing-dots i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.45; animation: call-typing-bounce 1.2s infinite ease-in-out; }
+    .call-typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+    .call-typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+    @keyframes call-typing-bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-4px); opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) { .call-typing-dots i { animation: none; opacity: 0.8; } }
+  `
+  document.head.appendChild(style)
+}
+
+function showCallTypingIndicator(page) {
+  const container = page?.querySelector('#call-messages')
+  if (!container) return null
+  ensureCallTypingStyle()
+  const el = document.createElement('div')
+  el.className = 'call-msg call-msg-assistant call-msg-typing'
+  el.innerHTML = '<span class="call-msg-text call-typing-dots"><i></i><i></i><i></i></span>'
+  container.appendChild(el)
+  const conversation = page.querySelector('#call-conversation')
+  if (conversation) conversation.scrollTop = conversation.scrollHeight
+  return el
+}
+
+function removeCallTypingIndicator(el) {
+  if (el && el.parentNode) el.remove()
+}
+
+
+function withCallTimeout(promise, ms, msg) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(msg)), ms)
+    Promise.resolve(promise).then(
+      v => { clearTimeout(timer); resolve(v) },
+      e => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
+function callAIWithTimeout(messages, opts) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('对方响应超时（' + Math.round(CALL_AI_TIMEOUT_MS / 1000) + ' 秒）')), CALL_AI_TIMEOUT_MS)
+    window.callAI(messages, opts).then(
+      v => { clearTimeout(timer); resolve(v) },
+      e => { clearTimeout(timer); reject(e) }
+    )
+  })
+}
+
+function clearCallRetryStatus(page) {
+  const el = page.querySelector('#call-status')
+  if (!el) return
+  el.onclick = null
+  el.style.cursor = ''
+  el.style.textDecoration = ''
+}
+
+function showCallRetryStatus(page) {
+  const el = page.querySelector('#call-status')
+  if (!el) return
+  el.textContent = '对方没有响应，点这里重试'
+  el.style.cursor = 'pointer'
+  el.style.textDecoration = 'underline'
+  el.onclick = () => {
+    if (_callState !== 'connecting') { clearCallRetryStatus(page); return }
+    if (_callAISending) return
+    sendCallAIRequest(page)
+  }
+}
 
 async function sendCallAIRequest(page) {
+  const mySession = _callSessionId
+  if (!_callSystemPrompt) { window.toast?.('通话资料还在准备中，请稍候'); return }
   if (_callAISending) return
   _callAISending = true
 
   const statusEl = page.querySelector('#call-status')
   const prevStatus = statusEl?.textContent || ''
-
+  let typingEl = null
   try {
     if (_callState === 'connecting') {
-      updateCallStatus(page, '正在等待接听...')
+      clearCallRetryStatus(page)
+      updateCallStatus(page, '对方正在接听...')
     }
 
     let messages = _callHistory.map(m => ({ role: m.role, content: m.content }))
-
+    // 回到通话后的第一次请求：附带一句"刚才中断了"的提示（不写进通话记录）
+    if (_callResumeNote) {
+      const last = messages[messages.length - 1]
+      if (last && last.role === 'user') {
+        messages[messages.length - 1] = { role: 'user', content: String(last.content || '') + '\n' + _callResumeNote }
+      } else {
+        messages.push({ role: 'user', content: _callResumeNote })
+      }
+    }
     if (_realCameraActive && _callType === 'video') {
       const frame = await captureVideoFrame()
       if (frame) {
@@ -19968,17 +21935,26 @@ async function sendCallAIRequest(page) {
         }
       }
     }
-
-    const raw = await window.callAI(messages, {
+  typingEl = page.querySelector('.call-msg-typing') || showCallTypingIndicator(page)
+    const raw = await callAIWithTimeout(messages, {
       system: _callSystemPrompt,
       responseFormat: 'json_object',
       responseJsonSchema: CALL_AI_JSON_SCHEMA,
       temperature: await window.getAITemperaturePreset('wechatCall')
     })
-
+    removeCallTypingIndicator(typingEl)
+    typingEl = null
     if (_callState === 'idle') return
 
+    if (mySession !== _callSessionId) return // 旧通话遗留的请求，直接丢弃
     const parsed = extractCallJson(raw)
+    if (window.ProseGuard && window.ProseGuard.isEnabled('wechat') && parsed.speech) {
+      try {
+        const pg = await window.ProseGuard.polishText(parsed.speech, { allow: 0, maxUnits: 2, protect: [/【[^】]*】/] })
+        if (pg.fixed) parsed.speech = pg.text
+      } catch (e) { console.warn('[call] 文风润色失败，使用原文', e) }
+      if (_callState === 'idle') return
+    }
 
     _callHistory.push({
       role: 'assistant',
@@ -19987,26 +21963,31 @@ async function sendCallAIRequest(page) {
       speech: parsed.speech,
       timestamp: Date.now()
     })
-
+    _callResumeNote = ''
     if (_callState === 'connecting') {
       _callState = 'connected'
       _callStartTime = Date.now()
       startCallTimer(page)
     }
+    _callLastActivity = Date.now()
+    startCallIdleWatch()
+    saveCallDraft()
 
     updateCallScene(page, parsed.scene)
     updateCallSpeech(page, parsed.speech)
 
-    playCallTTS(parsed.speech)
+    if (_callAutoSpeak) playCallTTS(parsed.speech)
 
   } catch (e) {
     console.error('通话 AI 请求失败', e)
+    if (mySession !== _callSessionId || _callState === 'idle') return
     if (_callState === 'connecting') {
-      updateCallStatus(page, '连接失败')
+      showCallRetryStatus(page)
     }
     window.toast?.('通话出错：' + (e.message || '').slice(0, 100))
   } finally {
-    _callAISending = false
+    removeCallTypingIndicator(typingEl)
+    if (mySession === _callSessionId) _callAISending = false
   }
 }
 
@@ -20060,10 +22041,14 @@ function updateCallSpeech(page, speechText) {
     div.className = 'call-msg call-msg-assistant'
     const bilingualParsed = helpers.parseBilingualText?.(speechText)
     if (bilingualParsed?.translation) {
-      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span>`
+      div.innerHTML = `<span class="call-msg-text"><span class="call-msg-original">${helpers.wcEscHtml?.(bilingualParsed.original) || speechText}</span><span class="call-msg-translation">${helpers.wcEscHtml?.(bilingualParsed.translation) || bilingualParsed.translation}</span></span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     } else {
-      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span>`
+      div.innerHTML = `<span class="call-msg-text">${helpers.wcEscHtml?.(speechText) || speechText}</span><button type="button" class="call-msg-speak" title="朗读"><i class="fa-solid fa-volume-high"></i></button>`
     }
+    div.querySelector('.call-msg-speak')?.addEventListener('click', e => {
+      e.stopPropagation()
+      playCallTTS(speechText)
+    })
     container.appendChild(div)
     const conversation = page.querySelector('#call-conversation')
     if (conversation) conversation.scrollTop = conversation.scrollHeight
@@ -20099,12 +22084,38 @@ function getCallDurationSeconds() {
 
 // ===== TTS =====
 
+// iPhone 只允许“被触摸解锁过的音频元素”在没有手势时自动播放。回车发送不算触摸，
+// 所以通话里全程复用同一个 Audio 元素：点屏幕时解锁一次，之后每条语音只换 src。
+let _callSharedAudio = null
+const CALL_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+function getCallSharedAudio() {
+  if (!_callSharedAudio) {
+    _callSharedAudio = new Audio()
+    _callSharedAudio.preload = 'auto'
+  }
+  return _callSharedAudio
+}
+
 function unlockCallAudioPlayback() {
   const keepAliveAudio = document.getElementById('keepalive-audio')
-  if (!keepAliveAudio) return
+  if (keepAliveAudio) {
+    try {
+      keepAliveAudio.volume = 0
+      keepAliveAudio.play().catch(() => {})
+    } catch (_) {}
+  }
   try {
-    keepAliveAudio.volume = 0
-    keepAliveAudio.play().catch(() => {})
+    const a = getCallSharedAudio()
+    if (a._callUnlocked || _callAudioBlobUrl) return
+    a.src = CALL_SILENT_WAV
+    const p = a.play()
+    if (p && p.then) {
+      p.then(() => {
+        a._callUnlocked = true
+        if (String(a.src).startsWith('data:audio/wav')) a.pause()
+      }).catch(() => {})
+    }
   } catch (_) {}
 }
 
@@ -20149,14 +22160,16 @@ async function playCallAudioBlob(blobUrl) {
   stopCallAudio()
   _callPendingAudioBlobUrl = null
   _callAudioBlobUrl = blobUrl
-  _callAudioPlayer = new Audio(blobUrl)
-  _callAudioPlayer.addEventListener('ended', () => {
-    _callAudioPlayer = null
+  const sharedAudio = getCallSharedAudio()
+  _callAudioPlayer = sharedAudio
+  sharedAudio.onended = () => {
+    if (_callAudioPlayer === sharedAudio) _callAudioPlayer = null
     if (_callAudioBlobUrl === blobUrl) _callAudioBlobUrl = null
     URL.revokeObjectURL(blobUrl)
-  })
+  }
+  sharedAudio.src = blobUrl
   try {
-    await _callAudioPlayer.play()
+    await sharedAudio.play()
     clearCallAudioPlayRetry()
   } catch (e) {
     console.warn('通话音频播放失败', e.name || e.message || e)
@@ -20184,21 +22197,19 @@ async function playCallTTS(speechText) {
 async function tryPlayCallTTS(speechText, requestSeq) {
   if (_callState === 'idle') return
   try {
-    const voiceIdCfg = await db.config.get(`chatVoiceId_${_callChatId}`)
-    if (_callState === 'idle') return
-    const voiceId = voiceIdCfg?.value
-    if (!voiceId) return
-
     const helpers = h()
-    if (typeof helpers.callMinimaxTTS !== 'function') return
+    if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') return
+    const voiceId = await helpers.getChatVoiceId(_callChatId)
+    if (_callState === 'idle') return
+    if (!voiceId) return
     let ttsText = speechText
     const bilingualParsed = helpers.parseBilingualText?.(speechText)
     if (bilingualParsed?.original) {
       ttsText = bilingualParsed.original
     }
 
-    const blobUrl = await helpers.callMinimaxTTS(ttsText, voiceId)
-    if (!blobUrl) throw new Error('Minimax TTS 未返回音频地址')
+    const blobUrl = await helpers.callTTS(ttsText, voiceId)
+    if (!blobUrl) throw new Error('语音合成未返回音频地址')
     if (_callState === 'idle') {
       URL.revokeObjectURL(blobUrl)
       return
@@ -20214,6 +22225,7 @@ async function tryPlayCallTTS(speechText, requestSeq) {
 function stopCallAudio() {
   clearCallAudioPlayRetry()
   if (_callAudioPlayer) {
+    _callAudioPlayer.onended = null
     _callAudioPlayer.pause()
     _callAudioPlayer = null
   }
@@ -20450,16 +22462,177 @@ function dispatchCallStateChange() {
     detail: { state: _callState, charId: _callCharId, chatId: _callChatId, minimized: _callMinimized }
   }))
 }
+// 续接的通话：把新内容合并回原记录和聊天里原来那条通话消息
+async function mergeResumedCall(recordId, info) {
+  try {
+    const old = await db.callRecords.get(recordId)
+    if (!old) return false
+        await db.callRecords.update(recordId, { duration: info.duration, messages: info.messages })
+    triggerCallMemory(old.chatId, old.charId, old.ownerUid, recordId)
+    const mm = String(Math.floor(info.duration / 60)).padStart(2, '0')
+    const ss = String(info.duration % 60).padStart(2, '0')
+    const typeLabel = info.type === 'video' ? '视频通话' : '语音通话'
+    const content = `[${typeLabel} ${mm}:${ss}]`
+    const linked = await db.messages.where('chatId').equals(info.chatId)
+      .filter(m => Number(m.callRecordId) === Number(recordId)).first()
+    if (linked) {
+      await db.messages.update(linked.id, { content, createdAt: info.msgTime })
+    } else {
+      await addPrivateMessageIdempotently({
+        chatId: info.chatId,
+        charId: info.charId,
+        role: info.initiator === 'char' ? 'assistant' : 'user',
+        content,
+        callRecordId: recordId,
+        createdAt: info.msgTime
+      })
+    }
+    return true
+  } catch (e) {
+    console.error('合并通话记录失败', e)
+    return false
+  }
+}
 
+// 点聊天里的通话气泡 → 打开这次通话的详情页（里面有「回到通话」按钮）
+async function openCallRecordFromMessage(msgId) {
+  const msg = await db.messages.get(msgId)
+  if (!msg) return
+  let record = null
+  const linkedId = Number(msg.callRecordId)
+  if (Number.isInteger(linkedId) && linkedId > 0) record = await db.callRecords.get(linkedId)
+  if (!record) {
+    // 老消息没有关联 id：按类型+时长+时间就近匹配
+    const m = String(msg.content || '').match(/^\[(视频通话|语音通话)\s+(\d{2}):(\d{2})\]$/)
+    if (m) {
+      const type = m[1] === '视频通话' ? 'video' : 'voice'
+      const dur = Number(m[2]) * 60 + Number(m[3])
+      const rows = await db.callRecords.where('chatId').equals(msg.chatId).toArray()
+      let bestDist = Infinity
+      for (const r of rows) {
+        if ((r.type === 'video' ? 'video' : 'voice') !== type || Number(r.duration) !== dur) continue
+        const d = Math.abs((Number(msg.createdAt) || 0) - ((Number(r.createdAt) || 0) + dur * 1000))
+        if (d < bestDist) { record = r; bestDist = d }
+      }
+    }
+  }
+  if (!record) { window.toast?.('没有找到这次通话的内容'); return }
+  const display = await getCallDisplayFor(record.ownerUid || window._wechatUid, record.charId)
+  openCallRecordDetail(record.id, display?.name || '', record.ownerUid)
+}
+window.openCallRecordFromMessage = openCallRecordFromMessage
+
+// 回到通话：还原之前的对话和计时，接着原来的进度聊
+async function resumeCall(recordId) {
+  if (_callState !== 'idle') { window.toast?.('正在通话中'); return }
+  let record = null
+  try { record = await db.callRecords.get(recordId) } catch (_) {}
+  if (!record || !Array.isArray(record.messages) || !record.messages.length) {
+    window.toast?.('这条通话没有可续接的内容')
+    return
+  }
+  unlockCallAudioPlayback()
+
+  const chatId = record.chatId
+  const charId = record.charId
+  const type = record.type === 'video' ? 'video' : 'voice'
+  _callChatId = chatId
+  _callCharId = charId
+  _callType = type
+  _callState = 'connecting'
+  _callStartTime = null
+  _callInitiator = record.initiator || 'user'
+  _realCameraActive = false
+  _realCameraStream = null
+  _callResumeRecordId = record.id
+  _callHistory = record.messages.map(m => ({
+    role: m.role,
+    content: m.content,
+    scene: m.scene || undefined,
+    speech: m.speech || undefined,
+    timestamp: m.timestamp || Date.now()
+  }))
+
+  const helpers = h()
+  const char = await helpers.getWechatDisplayCharacter?.(charId)
+  if (!char) {
+    window.toast?.('角色不存在')
+    resetCallState()
+    return
+  }
+  try {
+    const autoCfg = await db.config.get('callAutoSpeak')
+    _callAutoSpeak = autoCfg ? autoCfg.value !== false : true
+  } catch (_) { _callAutoSpeak = true }
+
+  const page = document.createElement('div')
+  page.id = 'call-page'
+  page.className = `full-page call-page ${type === 'video' ? 'video-call-page' : 'voice-call-page'}`
+  page.dataset.chatId = chatId
+  page.dataset.charId = charId
+  page.innerHTML = type === 'video' ? buildVideoCallPageHTML(char) : buildVoiceCallPageHTML(char)
+  window.openPage(page)
+  bindCallEvents(page, type)
+
+  // 把之前的对话气泡重新画出来（第一条是"发起了通话"的开场白，不显示）
+  _callHistory.forEach((m, i) => {
+    if (m.role === 'user') {
+      if (i === 0) return
+      appendCallUserBubble(page, m.content || '')
+    } else if (m.role === 'assistant') {
+      let scene = m.scene || ''
+      let speech = m.speech || ''
+      if (!scene && !speech && m.content) {
+        try {
+          const p = JSON.parse(m.content)
+          scene = p.scene || ''
+          speech = p.speech || ''
+        } catch (_) { speech = m.content }
+      }
+      if (scene) updateCallScene(page, scene)
+      if (speech) updateCallSpeech(page, speech)
+    }
+  })
+
+  try {
+    _callSystemPrompt = type === 'video'
+      ? await buildVideoCallSystemPrompt(chatId, charId)
+      : await buildVoiceCallSystemPrompt(chatId, charId)
+    const userName = window._wechatUser?.name || '用户'
+    _callResumeNote = `（系统提示：刚才的${type === 'video' ? '视频通话' : '通话'}意外中断了，现在${userName}重新接通了。请像真人一样自然地接上刚才的话题，不要重新开场，不要重复说过的话。）`
+
+    // 计时接着原来的时长走
+    _callState = 'connected'
+    _callStartTime = Date.now() - Math.max(0, Number(record.duration) || 0) * 1000
+    _callLastActivity = Date.now()
+    startCallTimer(page)
+    startCallIdleWatch()
+    updateCallStatus(page, formatCallDuration())
+    dispatchCallStateChange()
+    saveCallDraft()
+    await sendCallAIRequest(page)
+  } catch (e) {
+    console.error('回到通话失败', e)
+    updateCallStatus(page, '连接失败')
+    window.toast?.('回到通话失败：' + (e.message || '未知错误'))
+  }
+}
+window.resumeCall = resumeCall
 // ===== 结束通话 =====
 
-async function endCall() {
+async function endCall(opts = {}) {
   const chatId = _callChatId
   const charId = _callCharId
   const type = _callType
   const initiator = _callInitiator
-  const duration = getCallDurationSeconds()
-  const durationStr = formatCallDuration()
+  const resumeId = _callResumeRecordId
+  // opts.endAt：闲置自动挂断时，时长只算到最后一次说话
+  const endAt = (opts && typeof opts.endAt === 'number' && _callStartTime) ? opts.endAt : null
+  const duration = endAt ? Math.max(0, Math.floor((endAt - _callStartTime) / 1000)) : getCallDurationSeconds()
+  const durationStr = endAt
+    ? `${String(Math.floor(duration / 60)).padStart(2, '0')}:${String(duration % 60).padStart(2, '0')}`
+    : formatCallDuration()
+  stopCallIdleWatch()
   const history = [..._callHistory]
   const startTime = _callStartTime || Date.now()
 
@@ -20483,46 +22656,70 @@ async function endCall() {
   window.closePage('call-page')
 
   if (chatId && duration > 0) {
-    let callRecordId = null
-    try {
-      callRecordId = await db.callRecords.add({
-        chatId,
-        charId,
-        ownerUid: window._wechatUid,
-        type: type || 'voice',
-        initiator,
-        duration,
-        messages: history.map(m => ({
-          role: m.role,
-          content: m.content,
-          scene: m.scene || undefined,
-          speech: m.speech || undefined,
-          timestamp: m.timestamp || Date.now()
-        })),
-        createdAt: startTime
+    const savedMessages = history.map(m => ({
+      role: m.role,
+      content: m.content,
+      scene: m.scene || undefined,
+      speech: m.speech || undefined,
+      timestamp: m.timestamp || Date.now()
+    }))
+
+    // 续接的通话：合并回原记录，不新增
+    let merged = false
+    if (resumeId) {
+      merged = await mergeResumedCall(resumeId, {
+        chatId, charId, type, initiator, duration, messages: savedMessages, msgTime: Date.now()
       })
-    } catch (e) {
-      console.error('保存通话记录失败', e)
+      if (merged) {
+        try {
+          const cw = document.querySelector(`.chat-window-page[data-chat-id="${chatId}"]`)
+          if (cw && typeof refreshChat === 'function') refreshChat(cw, { scrollToBottom: false })
+        } catch (_) {}
+      }
     }
 
-    try {
-      const typeLabel = type === 'video' ? '视频通话' : '语音通话'
-      const msgRole = initiator === 'char' ? 'assistant' : 'user'
-      await addPrivateMessageIdempotently({
-        chatId,
-        charId,
-        role: msgRole,
-        content: `[${typeLabel} ${durationStr}]`,
-        ...(callRecordId ? { callRecordId } : {}),
-        createdAt: Date.now()
-      })
-    } catch (e) {
-      console.error('保存通话消息失败', e)
+    if (!merged) {
+      let callRecordId = null
+      try {
+        callRecordId = await db.callRecords.add({
+          chatId,
+          charId,
+          ownerUid: window._wechatUid,
+          type: type || 'voice',
+          initiator,
+          duration,
+          messages: savedMessages,
+          createdAt: startTime
+        })
+      } catch (e) {
+        console.error('保存通话记录失败', e)
+      }
+      triggerCallMemory(chatId, charId, window._wechatUid, callRecordId)
+      try {
+        const typeLabel = type === 'video' ? '视频通话' : '语音通话'
+        const msgRole = initiator === 'char' ? 'assistant' : 'user'
+        await addPrivateMessageIdempotently({
+          chatId,
+          charId,
+          role: msgRole,
+          content: `[${typeLabel} ${durationStr}]`,
+          ...(callRecordId ? { callRecordId } : {}),
+          createdAt: Date.now()
+        })
+      } catch (e) {
+        console.error('保存通话消息失败', e)
+      }
     }
   }
+  await clearCallDraft()
 }
 
 function resetCallState() {
+  _callSessionId++
+  stopCallIdleWatch()
+  _callLastActivity = 0
+  _callResumeRecordId = null
+  _callResumeNote = ''
   cancelCallTTSRetry()
   _callTTSCanceledRetrySeqs = new Set()
   _callHistory = []
@@ -20633,6 +22830,7 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
   const user = ownerUid ? await db.characters.get(ownerUid) : null
   const userName = getCallUserBaseName(user)
   let messagesHTML = ''
+  const callSpeechList = []
   for (const m of (record.messages || [])) {
     if (m.role === 'user') {
       const content = m.content || ''
@@ -20657,7 +22855,8 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
         const speechHTML = bilingualParsed.translation
           ? `<span class="call-detail-original">${callEscHtml(bilingualParsed.original)}</span><span class="call-detail-translation">${callEscHtml(bilingualParsed.translation)}</span>`
           : callEscHtml(speech)
-        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span></div>`
+        callSpeechList.push(bilingualParsed.original || speech)
+        messagesHTML += `<div class="call-detail-msg call-detail-assistant"><span class="call-detail-sender">${callEscHtml(charName || '角色')}</span><span class="call-detail-text">${speechHTML}</span><button type="button" class="call-detail-speak" data-idx="${callSpeechList.length - 1}" title="朗读"><i class="fa-solid fa-volume-high"></i></button></div>`
       }
     }
   }
@@ -20673,12 +22872,27 @@ async function openCallRecordDetail(recordId, charName, ownerUid) {
       <div class="call-detail-time">${callEscHtml(time)}</div>
       <div class="call-detail-duration">${callEscHtml(typeLabel)} · ${mm}:${ss}</div>
     </div>
+       ${(record.messages || []).length ? `<div style="padding:12px 16px 0;"><button type="button" id="btn-call-resume" style="width:100%;padding:12px 0;border:none;border-radius:10px;background:var(--accent-color,#07c160);color:#fff;font-size:16px;"><i class="fa-solid ${record.type === 'video' ? 'fa-video' : 'fa-phone'}"></i> 回到通话</button></div>` : ''}
     <div class="call-detail-messages">${messagesHTML}</div>
   `
 
   window.openPage(page)
   page.querySelector('#btn-call-detail-back').addEventListener('click', () => {
+    stopSpeakOnce()
     window.closePage('call-record-detail-page')
+  })
+    page.querySelector('#btn-call-resume')?.addEventListener('click', () => {
+    if (_callState !== 'idle') { window.toast?.('正在通话中'); return }
+    stopSpeakOnce()
+    window.closePage('call-record-detail-page')
+    if (document.getElementById('call-records-page')) window.closePage('call-records-page')
+    setTimeout(() => resumeCall(record.id), 350)
+  })
+  page.querySelectorAll('.call-detail-speak').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const text = callSpeechList[parseInt(btn.dataset.idx, 10)]
+      if (text) speakTextOnce(record.chatId, text, btn)
+    })
   })
 }
 
@@ -20927,6 +23141,8 @@ window.WanWanWechatOnline = {
 Object.defineProperty(window, '_wechatUid', { get() { return _wechatUid } })
 window._wechatCallHelpers = {
   getChatHistoryLimit,
+  getChatActiveReplySettings,
+  setChatActiveReplyEnabled,
   buildUnifiedChatTimeline,
   buildWechatReplyContext,
   estimateWechatPromptContext,
@@ -20938,6 +23154,13 @@ window._wechatCallHelpers = {
   getChatBilingualSettings,
   buildCurrentRelationText,
   callMinimaxTTS,
+  callTTS,
+  getChatVoiceId,
+  getTTSTagHint,
+  isTTSTagEnabled,
+  getScheduleContext,
+  getCharScheduleContext,
+  speakTextOnce,
   blobUrlToDataUrl,
   getTimeOfDay,
   getWechatDisplayCharacter,

@@ -420,6 +420,7 @@
   min-width: 0;
 }
 
+.miss-entry-speak,
 .miss-entry-more,
 .miss-entry-delete {
   width: 30px;
@@ -598,7 +599,8 @@ html.has-android-bottom-inset .miss-compose {
   animation-delay: 0.3s;
 }
 
-.miss-settings-btn {
+.miss-settings-btn,
+.miss-autospeak-btn {
   flex: 0 0 auto;
 }
 
@@ -811,6 +813,41 @@ html.has-android-bottom-inset .miss-compose {
   height: 14px;
 }
 
+.miss-record-delete-btn {
+  flex-shrink: 0;
+  color: var(--c-red);
+}
+
+.miss-record-delete-btn i,
+.miss-record-delete-btn svg {
+  font-size: 14px;
+  width: 14px;
+  height: 14px;
+}
+
+.miss-entry-resume {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  color: var(--c-accent-dark);
+  background: var(--c-surface-2);
+  font-size: 12px;
+  font-family: var(--font);
+  white-space: nowrap;
+}
+
+.miss-entry-resume:active {
+  opacity: 0.7;
+}
+
+.miss-summary-modal-message {
+  white-space: pre-line;
+}
+
 .miss-record-summary-btn:disabled,
 .miss-end-meet:disabled {
   opacity: 0.55;
@@ -912,3 +949,8 @@ html.has-android-bottom-inset .miss-compose {
   0%, 80%, 100% { transform: translateY(0); opacity: 0.35; }
   40% { transform: translateY(-3px); opacity: 1; }
 }
+
+/* 朗读对白按钮 */
+.miss-entry-speak.is-loading { opacity: 0.5; animation: missSpeakPulse 1s infinite ease-in-out; }
+.miss-entry-speak.is-playing { color: var(--c-accent); }
+@keyframes missSpeakPulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 0.25; } }

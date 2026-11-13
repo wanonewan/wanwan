@@ -46,8 +46,17 @@ window.buildLorebookSegments = function(matchedEntries) {
   }
 }
 
+// 条目标题以「[线上]」或「[线下]」开头时，只在对应场景使用（也兼容【线上】【线下】）
+// scene: 'online'（微信聊天/通话）| 'offline'（想见你）| 不传（不过滤）；没写前缀的条目两边都用
+function lbEntryMatchesScene(entry, scene) {
+  if (!scene) return true
+  const m = String(entry?.title || '').match(/^\s*[\[【]\s*(线上|线下)\s*[\]】]/)
+  if (!m) return true
+  return (m[1] === '线上') === (scene !== 'offline')
+}
+
 // 收集命中的条目对象（含 position/injectOrder）
-async function collectLorebookEntries(charId, recentMessages) {
+async function collectLorebookEntries(charId, recentMessages, options) {
   const books = await loadLorebooks()
   if (!books.length) return []
 
@@ -60,6 +69,7 @@ async function collectLorebookEntries(charId, recentMessages) {
     if (book.scope === 'personal' && !ids.includes(charId)) continue
     for (const entry of book.entries || []) {
       if (!entry.enabled) continue
+      if (!lbEntryMatchesScene(entry, options?.scene)) continue
       const noKeywords = !entry.keywords || entry.keywords.length === 0
       const keywordHit = entry.keywords?.some(kw => kw && dialogText.includes(kw))
       if (noKeywords || keywordHit) matched.push(entry)
@@ -69,14 +79,14 @@ async function collectLorebookEntries(charId, recentMessages) {
 }
 
 // ===== 全局注入函数（分段版，供 wechat.js / miss-you.js 调用） =====
-window.getLorebookContextSegments = async function(charId, recentMessages) {
-  const matched = await collectLorebookEntries(charId, recentMessages)
+window.getLorebookContextSegments = async function(charId, recentMessages, options) {
+  const matched = await collectLorebookEntries(charId, recentMessages, options)
   return window.buildLorebookSegments(matched)
 }
 
 // ===== 全局注入函数（合并串，行为兼容旧调用点） =====
-window.getLorebookContext = async function(charId, recentMessages) {
-  const seg = await window.getLorebookContextSegments(charId, recentMessages)
+window.getLorebookContext = async function(charId, recentMessages, options) {
+  const seg = await window.getLorebookContextSegments(charId, recentMessages, options)
   return [seg.before, seg.middle, seg.after].filter(Boolean).join('\n\n')
 }
 
@@ -98,7 +108,9 @@ function buildLorebookListPage() {
       </button>
       <span class="header-title">世界书</span>
       <div style="display:flex;gap:8px">
+        <button class="btn-icon" id="btn-import-lb" title="导入JSON"><i class="fa fa-upload"></i></button>
         <button class="btn-icon" id="btn-new-lb"><i class="fa fa-plus"></i></button>
+        <input type="file" id="lb-import-input" accept=".json,application/json,text/plain" multiple style="display:none">
       </div>
     </div>
     <!-- 作用域Tab -->
@@ -196,6 +208,15 @@ function bindLbListEvents(page) {
   })
 
   page.querySelector('#btn-new-lb').addEventListener('click', () => showNewLbModal(page))
+
+  const importBtn = page.querySelector('#btn-import-lb')
+  const importInput = page.querySelector('#lb-import-input')
+  importBtn.addEventListener('click', () => importInput.click())
+  importInput.addEventListener('change', async () => {
+    const files = [...importInput.files]
+    importInput.value = ''
+    if (files.length) await importLorebookFiles(page, files)
+  })
 }
 
 // ===== 新建世界书弹窗 =====
@@ -282,9 +303,11 @@ function buildLbEntryPage(book) {
       <button class="header-back"><i class="fa fa-angle-left"></i></button>
       <input class="header-title-input" id="lb-name-edit" value="${book.name}" style="flex:1;background:none;border:none;font-size:17px;font-weight:500">
       <div style="display:flex;gap:4px;flex-shrink:0">
+        <button class="btn-icon" id="btn-import-entries" title="导入JSON条目"><i class="fa fa-upload"></i></button>
         <button class="btn-icon" id="btn-export-lb" title="导出"><i class="fa fa-download"></i></button>
         <button class="btn-icon" id="btn-delete-lb" title="删除书"><i class="fa fa-trash"></i></button>
         <button class="btn-icon" id="btn-add-entry" title="添加条目"><i class="fa fa-plus"></i></button>
+        <input type="file" id="lb-entries-import-input" accept=".json,application/json,text/plain" multiple style="display:none">
       </div>
     </div>
     ${book.scope === 'personal' ? `
@@ -362,6 +385,15 @@ function bindEntryCardEvents(list, page, book) {
 function bindEntryPageEvents(page, book) {
   page.querySelector('#btn-add-entry').addEventListener('click', () => {
     showEntryEditSheet(page, book, null)
+  })
+
+  const entriesImportBtn = page.querySelector('#btn-import-entries')
+  const entriesImportInput = page.querySelector('#lb-entries-import-input')
+  entriesImportBtn.addEventListener('click', () => entriesImportInput.click())
+  entriesImportInput.addEventListener('change', async () => {
+    const files = [...entriesImportInput.files]
+    entriesImportInput.value = ''
+    if (files.length) await importEntriesIntoBook(page, book, files)
   })
 
   page.querySelector('#btn-export-lb').addEventListener('click', async () => {
@@ -792,4 +824,126 @@ function lbDownloadJSON(data, filename) {
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
   a.download = filename
   a.click()
+}
+
+// ===== JSON 导入（整本世界书 / 多条条目） =====
+// 支持：本页「导出」生成的整本 JSON、多本书组成的数组、或只有条目的数组；可一次选多个文件
+function lbCleanKeywords(v) {
+  const arr = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(/[,，、\n]/) : [])
+  return [...new Set(arr.map(k => String(k ?? '').trim()).filter(Boolean))]
+}
+
+function lbNormalizeImportedEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const content = String(raw.content ?? '').trim()
+  if (!content) return null
+  const entry = {
+    ...raw,
+    id: lbGenId(),
+    title: String(raw.title ?? '').trim(),
+    content,
+    keywords: lbCleanKeywords(raw.keywords),
+    position: lbNormalizePosition(raw.position),
+    enabled: raw.enabled !== false
+  }
+  const order = raw.injectOrder
+  if (order !== '' && order != null && Number.isFinite(Number(order))) entry.injectOrder = Number(order)
+  else delete entry.injectOrder
+  return entry
+}
+
+// 读取并解析一个 JSON 文件，返回 { books: [原始书对象], loose: [原始条目对象], baseName }
+async function lbReadImportJSON(file) {
+  let text = await file.text()
+  text = text.replace(/^\uFEFF/, '')
+  let data
+  try { data = JSON.parse(text) } catch (_) { throw new Error('不是有效的 JSON 文件') }
+  const books = []
+  const loose = []
+  const collect = node => {
+    if (Array.isArray(node)) { node.forEach(collect); return }
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node.entries)) books.push(node)
+    else if (Array.isArray(node.books)) node.books.forEach(collect)
+    else if (typeof node.content === 'string') loose.push(node)
+  }
+  collect(data)
+  if (!books.length && !loose.length) throw new Error('文件里没有找到世界书或条目')
+  return { books, loose, baseName: (file.name || '').replace(/\.json$/i, '') || '导入的世界书' }
+}
+
+// 列表页：导入整本世界书（每本都会新建，不会覆盖已有的书）
+async function importLorebookFiles(listPage, files) {
+  try {
+    const existing = await loadLorebooks()
+    const chars = await db.characters.toArray()
+    const validCharIds = new Set(chars.map(c => c.id))
+    const names = new Set(existing.map(b => b.name))
+    const added = []
+    let entryCount = 0
+    let personalNoChar = 0
+
+    for (const file of files) {
+      const { books, loose, baseName } = await lbReadImportJSON(file)
+      const sources = [...books]
+      if (loose.length) sources.push({ name: baseName, scope: 'global', entries: loose })
+      for (const raw of sources) {
+        const entries = (raw.entries || []).map(lbNormalizeImportedEntry).filter(Boolean)
+        let name = String(raw.name || baseName || '导入的世界书').trim()
+        if (names.has(name)) name += '（导入）'
+        names.add(name)
+        const scope = raw.scope === 'personal' ? 'personal' : 'global'
+        const charIds = scope === 'personal'
+          ? (Array.isArray(raw.charIds) ? raw.charIds : []).filter(id => validCharIds.has(id))
+          : []
+        if (scope === 'personal' && !charIds.length) personalNoChar++
+        added.push({ id: lbGenId(), name, scope, charIds, enabled: raw.enabled !== false, entries })
+        entryCount += entries.length
+      }
+    }
+
+    if (!added.length) { window.toast('没有可导入的内容'); return }
+    await saveLorebooks([...existing, ...added])
+    window.toast(`已导入 ${added.length} 本世界书，共 ${entryCount} 条条目`)
+    if (personalNoChar) {
+      setTimeout(() => window.toast('有单人书没有对应的绑定角色，请进入书里点「编辑」重新绑定'), 1800)
+    }
+    loadLbList(listPage, listPage.dataset.lbScope || 'all')
+  } catch (e) {
+    window.toast('导入失败：' + (e.message || '无法读取文件'))
+  }
+}
+
+// 条目页：把 JSON 里的多条条目追加到当前这本书（标题和内容都相同的会跳过）
+async function importEntriesIntoBook(entryPage, book, files) {
+  try {
+    const books = await loadLorebooks()
+    const b = books.find(bk => bk.id === book.id)
+    if (!b) { window.toast('找不到这本世界书'); return }
+    const seen = new Set((b.entries || []).map(e => `${e.title || ''}\n${e.content || ''}`))
+    let added = 0
+    let skipped = 0
+
+    for (const file of files) {
+      const { books: srcBooks, loose } = await lbReadImportJSON(file)
+      const rawEntries = [...srcBooks.flatMap(sb => sb.entries || []), ...loose]
+      for (const raw of rawEntries) {
+        const entry = lbNormalizeImportedEntry(raw)
+        if (!entry) continue
+        const key = `${entry.title}\n${entry.content}`
+        if (seen.has(key)) { skipped++; continue }
+        seen.add(key)
+        b.entries.push(entry)
+        added++
+      }
+    }
+
+    if (!added && !skipped) { window.toast('没有可导入的条目'); return }
+    book.entries = b.entries
+    await saveLorebooks(books)
+    renderEntryList(entryPage, book)
+    window.toast(skipped ? `已导入 ${added} 条，跳过 ${skipped} 条重复` : `已导入 ${added} 条条目`)
+  } catch (e) {
+    window.toast('导入失败：' + (e.message || '无法读取文件'))
+  }
 }

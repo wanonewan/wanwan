@@ -19,7 +19,8 @@ const PHONE_GEN_APP_LABELS = {
   photos: '相册',
   'game-center': 'Game Center',
   privacy: '隐私空间',
-  mail: 'Mail'
+  mail: 'Mail',
+  schedule: '日程'
 }
 
 window.PHONE_GEN_APP_LABELS = PHONE_GEN_APP_LABELS
@@ -236,12 +237,12 @@ function buildPhonePrivacySystemPrompt(char, user) {
 
 # 观看记录规则
 1. 生成 8-15 条观看记录，按时间倒序，时间跨度约最近一个月。
-2. 标题必须像真实成人网站的视频标题：直白露骨、夸张、关键词堆叠式，可中英混杂，长短参差；禁止文艺化、禁止含蓄修辞。
+2. 标题要像真实成人视频网站上的标题：看到标题就能知道视频的类型、场景和看点。写法通常是「场景或关系设定 + 类型标签 + 看点」，长短参差，可中英混杂，常带 [4K]、中字、完整版、合集这类站内标注；关键词堆叠式也可以。用词以平台上常见的分类名和场景名为准。禁止文艺化、禁止含蓄隐喻，也不要写成日常视频的标题。所有出演者一律是成年人，不涉及未成年人，也不涉及胁迫或非自愿的内容。
 3. progress（观看进度百分比 0-100）要讲故事：看完的（95-100）、只看了开头就关掉的（3-15，愧疚或被打断）、反复回看的经典（配合 watchCount 看过多次）。
 4. duration 是视频总长（"12:34" 格式，3-40 分钟为主）；time 是最后观看的相对时间，深夜时段为主，要呼应角色作息与近期剧情。
 5. channel（上传者/频道名）要有真实成人网站账号的感觉（英文/拼音/emoji 混杂皆可）。
-6. 口味要有主线：大部分记录围绕 1-2 个从人设推断出的明显偏好，夹杂 1-2 条猎奇偏离；偏好本身就在讲这个人是谁。
-7. desc 是一句话视频内容简介（详情页展示用），风格同标题。
+6. 口味要有主线：大部分记录围绕 1-2 个从人设推断出的明显偏好，夹杂 1-2 条猎奇偏离；视频风格各异但能展现角色特色，偏好本身就在讲这个人是谁。
+7. desc 是一句话视频内容简介（详情页展示用），客观概括场景和类型，语气平实，像站内的视频介绍。
 
 # 站内搜索规则
 1. 生成 4-8 条搜索关键词，按时间倒序。像真人打进搜索框的：短、直接、可以有错字、可以中英混杂。
@@ -312,7 +313,8 @@ const PHONE_GEN_APP_SYSTEM_BUILDERS = {
   photos: buildPhonePhotosSystemPrompt,
   'game-center': buildPhoneGameCenterSystemPrompt,
   privacy: buildPhonePrivacySystemPrompt,
-  mail: buildPhoneMailSystemPrompt
+  mail: buildPhoneMailSystemPrompt,
+  schedule: buildPhoneScheduleSystemPrompt
 }
 
 // ===== 共享：User Prompt（骨架与微信一致，只换任务句） =====
@@ -363,6 +365,92 @@ ${recentMessagesText}
 请严格按 system 中定义的 JSON 结构输出。`
 }
 
+// ===== 日程 =====
+function paDateKey(ts) {
+  const d = new Date(ts)
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+}
+
+function paFmtMonthDayTime(ts) {
+  const d = new Date(ts)
+  return String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+}
+
+function buildPhoneScheduleSystemPrompt(char, user) {
+  const charName = char?.nick || char?.name || '角色'
+  const userName = user?.nick || user?.name || '用户'
+  return `你是一个角色扮演世界的「手机内容生成器」。用户正在查看角色【${charName}】手机里的「日程」应用，你需要一次性生成他未来 7 天（含今天）的排班与日程。
+
+# 核心视角
+- 这是【${charName}】自己的日程。按人设里的职业、作息和生活习惯推断真实的工作节奏（例如飞行员有航班号、起降地、出勤和休息；上班族有会议和通勤）。工作之外也要有生活：运动、吃饭、休息、见朋友等，但不要排满。
+- 「聊天里已经确定的安排」是他亲口对${userName}说过的，必须原样出现在对应日期，时间保持一致，不得与之冲突；其余日期合理补充。
+- 休息日也要生成（items 为空数组，off 为 true）。
+- 不要替${userName}编造行程；与${userName}有关的内容只出现在 note 里，克制、一句话。
+- 内容必须和「角色与用户的真实聊天记录」在时间线上一致。
+
+# 规则
+1. 生成 7 天，从【今天的日期】起，按日期升序。
+2. 每天 0-6 条，按开始时间升序；时间用 24 小时制 HH:mm；跨天的事写成当天结束 23:59，并在 note 里说明。
+3. title 简短具体（如“CZ3085 广州→北京”“例会”“健身”）；place 可选；note 可选，一句话。
+
+# 输出格式
+只输出一个 JSON 对象，不要输出任何其他文字、注释或 markdown 代码块标记：
+
+{
+  "days": [
+    {
+      "date": "YYYY-MM-DD",
+      "off": false,
+      "items": [
+        { "start": "HH:mm", "end": "HH:mm", "title": "标题", "place": "地点", "note": "备注" }
+      ]
+    }
+  ]
+}`
+}
+
+async function buildPhoneScheduleExtraBlock(charId) {
+  let events = []
+  try {
+    const rec = await db.config.get('charSchedule')
+    const now = Date.now()
+    events = (rec?.value?.events || []).filter(e => String(e.charId) === String(charId) &&
+      e.status !== 'cancelled' && e.endAt > now - 86400000 && e.startAt < now + 8 * 86400000)
+      .sort((a, b) => a.startAt - b.startAt)
+  } catch (_) {}
+  const lines = events.length
+    ? events.map(e => `- ${paFmtMonthDayTime(e.startAt)} 至 ${paFmtMonthDayTime(e.endAt)}：${e.title}${e.status === 'done' ? '（已结束）' : ''}`).join('\n')
+    : '(暂无)'
+  return `【今天的日期】${paDateKey(Date.now())}\n\n【聊天里已经确定的安排】(角色在和用户聊天时亲口说过的真实安排，必须原样出现在排班里，时间一致，不得冲突)\n${lines}\n\n`
+}
+
+function sanitizePhoneScheduleData(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const clean = v => String(v ?? '').trim()
+  const hhmm = v => {
+    const m = clean(v).match(/^(\d{1,2}):(\d{2})$/)
+    if (!m) return ''
+    const h = Number(m[1]); const mi = Number(m[2])
+    if (h > 23 || mi > 59) return ''
+    return String(h).padStart(2, '0') + ':' + m[2]
+  }
+  const days = (Array.isArray(raw.days) ? raw.days : []).map(d => {
+    const date = clean(d?.date)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null
+    const items = (Array.isArray(d?.items) ? d.items : []).map(it => ({
+      start: hhmm(it?.start),
+      end: hhmm(it?.end),
+      title: clean(it?.title).slice(0, 40),
+      place: clean(it?.place).slice(0, 40),
+      note: clean(it?.note).slice(0, 60)
+    })).filter(it => it.title && it.start)
+      .sort((a, b) => a.start.localeCompare(b.start)).slice(0, 8)
+    return { date, off: d?.off === true && !items.length, items }
+  }).filter(Boolean).sort((a, b) => a.date.localeCompare(b.date)).slice(0, 8)
+  return { days }
+}
+
 // ===== 数据清洗 =====
 
 function sanitizePhoneBrowserData(raw) {
@@ -398,7 +486,7 @@ function sanitizePhoneNotesData(raw) {
     .map(n => ({
       title: clean(n?.title),
       time: clean(n?.time),
-      content: String(n?.content ?? '').replace(/\r\n/g, '\n').trim(),
+      content: String(n?.content ?? '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim(),
       pinned: n?.pinned === true
     }))
     .filter(n => n.content || n.title)
@@ -489,7 +577,7 @@ function sanitizePhoneMailData(raw) {
       sender: clean(e?.sender),
       address: clean(e?.address),
       subject: clean(e?.subject),
-      body: String(e?.body ?? '').replace(/\r\n/g, '\n').trim(),
+      body: String(e?.body ?? '').replace(/\r\n/g, '\n').replace(/\\n/g, '\n').trim(),
       time: clean(e?.time),
       unread: e?.unread === true,
       spam: e?.spam === true,
@@ -507,7 +595,8 @@ const PHONE_GEN_APP_SANITIZERS = {
   photos: sanitizePhonePhotosData,
   'game-center': sanitizePhoneGameCenterData,
   privacy: sanitizePhonePrivacyData,
-  mail: sanitizePhoneMailData
+  mail: sanitizePhoneMailData,
+  schedule: sanitizePhoneScheduleData
 }
 
 function phoneAppDataIsEmpty(appId, data) {
@@ -518,6 +607,7 @@ function phoneAppDataIsEmpty(appId, data) {
   if (appId === 'game-center') return !data.games.length
   if (appId === 'privacy') return !data.videos.length && !data.searches.length
   if (appId === 'mail') return !data.emails.length
+  if (appId === 'schedule') return !data.days.length
   return true
 }
 
@@ -561,6 +651,67 @@ function stampPhoneAppTimes(appId, data, now = Date.now()) {
 }
 
 // ===== 生成主流程（全量生成，已有快照直接覆盖） =====
+// 宽容的 JSON 解析：处理代码块、前后多余的文字、字符串里的裸换行、
+// 未转义的双引号、末尾多余的逗号、以及被截断的输出（会丢掉没写完的最后一项）
+function repairPhoneJsonLoose(src) {
+  let out = ''
+  let inStr = false
+  let esc = false
+  const stack = []
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]
+    if (inStr) {
+      if (esc) { out += c; esc = false; continue }
+      if (c === '\\') { out += c; esc = true; continue }
+      if (c === '"') {
+        // 后面第一个非空白字符是 , } ] : 才算字符串结束，否则当作正文里的引号
+        let j = i + 1
+        while (j < src.length && /\s/.test(src[j])) j++
+        const nx = src[j]
+        if (nx === undefined || nx === ',' || nx === '}' || nx === ']' || nx === ':') {
+          inStr = false
+          out += c
+        } else {
+          out += '\\"'
+        }
+        continue
+      }
+      if (c === '\n') { out += '\\n'; continue }
+      if (c === '\r') continue
+      if (c === '\t') { out += '\\t'; continue }
+      out += c
+      continue
+    }
+    if (c === '"') { inStr = true; out += c; continue }
+    if (c === '{' || c === '[') stack.push(c)
+    else if (c === '}' || c === ']') stack.pop()
+    out += c
+  }
+  if (inStr) out += '"'
+  out = out.replace(/[,\s]+$/, '')
+  while (stack.length) out += stack.pop() === '{' ? '}' : ']'
+  return out.replace(/,\s*([}\]])/g, '$1')
+}
+
+function parsePhoneSnapshotJsonLoose(raw) {
+  let text = String(raw == null ? '' : raw).replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+  const start = text.indexOf('{')
+  if (start < 0) return null
+  const end = text.lastIndexOf('}')
+  const body = end > start ? text.slice(start, end + 1) : text.slice(start)
+  const tryParse = s => {
+    try {
+      const v = JSON.parse(s)
+      return v && typeof v === 'object' ? v : null
+    } catch (_) {
+      return null
+    }
+  }
+  return tryParse(body) ||
+    tryParse(repairPhoneJsonLoose(body)) ||
+    (end > start ? tryParse(repairPhoneJsonLoose(text.slice(start))) : null)
+}
 
 async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
   if (typeof window.callAI !== 'function') throw new Error('请先在设置里配置 API')
@@ -582,14 +733,22 @@ async function generatePhoneAppSnapshot(appId, ownerUid, charId) {
   const wechatSnapshot = await getPhoneWechatSnapshot(ownerUid, charId)
 
   const system = buildSystem(char, user)
-  const userPrompt = await buildPhoneAppUserPrompt(appId, char, user, npcs, loreCtx, recentBlock.text, wechatSnapshot?.data)
+  let userPrompt = await buildPhoneAppUserPrompt(appId, char, user, npcs, loreCtx, recentBlock.text, wechatSnapshot?.data)
+  if (appId === 'schedule') userPrompt = (await buildPhoneScheduleExtraBlock(charId)) + userPrompt
   const raw = await window.callAI([{ role: 'user', content: userPrompt }], {
     system,
     responseFormat: 'json_object',
     temperature: await getPhoneSnapshotTemperature()
   })
-  const parsed = extractPhoneSnapshotJson(raw)
-  if (!parsed) throw new Error('AI 返回格式异常，请重试')
+  let parsed = null
+  try { parsed = extractPhoneSnapshotJson(raw) } catch (_) {}
+  if (!parsed) parsed = parsePhoneSnapshotJsonLoose(raw)
+  if (!parsed) {
+    window._lastPhoneSnapshotRaw = String(raw || '')
+    console.warn('[phone-apps] 返回格式异常，模型原始内容：', raw)
+    const hint = String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 60)
+    throw new Error('AI 返回格式异常，请重试' + (hint ? `（模型返回开头：${hint}）` : '（模型没有返回内容）'))
+  }
   const cleaned = sanitize(parsed)
   if (!cleaned || phoneAppDataIsEmpty(appId, cleaned)) throw new Error('生成结果为空，请重试')
 
@@ -623,7 +782,8 @@ const PHONE_APP_PAGE_IDS = [
   'phone-app-privacy-page',
   'phone-app-privacy-detail-page',
   'phone-app-mail-page',
-  'phone-app-mail-detail-page'
+  'phone-app-mail-detail-page',
+  'phone-app-schedule-page'
 ]
 
 function closePhoneAppSnapshotPages() {
@@ -1231,13 +1391,92 @@ function openPhoneMailDetailPage(email) {
 
 // ===== 主屏入口分发 =====
 
+// ===== 日程页面 =====
+
+async function renderPhoneSchedulePage(scroll, context) {
+  const snapshot = await getPhoneAppSnapshot('schedule', context.ownerUid, context.charId)
+  const days = snapshot?.data?.days || []
+  let real = []
+  try {
+    const rec = await db.config.get('charSchedule')
+    real = (rec?.value?.events || []).filter(e => String(e.charId) === String(context.charId) &&
+      e.status !== 'cancelled' && e.endAt > Date.now() - 86400000)
+      .sort((a, b) => a.startAt - b.startAt)
+  } catch (_) {}
+  const phaseLabel = e => {
+    const now = Date.now()
+    if (e.status === 'done') return '已结束'
+    if (now < e.startAt) return '稍后'
+    if (now < e.endAt) return '进行中'
+    return '待确认'
+  }
+  const weekday = date => '周' + '日一二三四五六'[new Date(date + 'T00:00:00').getDay()]
+  const todayKey = paDateKey(Date.now())
+
+  const realHTML = real.length
+    ? real.map(e => `
+        <div class="phone-sch-item">
+          <div class="phone-sch-time">${paEscHtml(paFmtMonthDayTime(e.startAt))}<br>${paEscHtml(paFmtMonthDayTime(e.endAt))}</div>
+          <div class="phone-sch-main">
+            <div class="phone-sch-title">${paEscHtml(e.title)}<span class="phone-sch-tag">${phaseLabel(e)}</span></div>
+          </div>
+        </div>`).join('')
+    : '<div class="phone-sch-empty">聊天里还没有他提过的安排</div>'
+
+  const daysHTML = days.length
+    ? days.map(d => `
+        <div class="phone-sch-card${d.date === todayKey ? ' is-today' : ''}">
+          <div class="phone-sch-date"><span>${paEscHtml(d.date.slice(5))} ${weekday(d.date)}${d.date === todayKey ? '（今天）' : ''}</span>${d.off ? '<span class="phone-sch-tag">休息</span>' : ''}</div>
+          ${d.items.map(it => `
+            <div class="phone-sch-item">
+              <div class="phone-sch-time">${paEscHtml(it.start)}${it.end ? ' – ' + paEscHtml(it.end) : ''}</div>
+              <div class="phone-sch-main">
+                <div class="phone-sch-title">${paEscHtml(it.title)}</div>
+                ${(it.place || it.note) ? `<div class="phone-sch-sub">${paEscHtml([it.place, it.note].filter(Boolean).join('｜'))}</div>` : ''}
+              </div>
+            </div>`).join('')}
+        </div>`).join('')
+    : '<div class="phone-sch-empty">还没有生成排班表</div>'
+
+  scroll.innerHTML = `
+    <div class="phone-app-section-title">聊天里提到的安排</div>
+    <div class="phone-sch-card">${realHTML}</div>
+    <div class="phone-app-section-title">排班表（模拟，会参考上面的安排）</div>
+    ${daysHTML}
+    <button class="phone-sch-gen" type="button">${days.length ? '重新生成排班表' : '生成排班表'}</button>
+    <div class="phone-sch-hint">点击会调用一次 AI；重新生成会覆盖现有的排班表，不会影响聊天里提到的安排。</div>
+  `
+  const btn = scroll.querySelector('.phone-sch-gen')
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return
+    btn.disabled = true
+    const old = btn.textContent
+    btn.textContent = '生成中…'
+    try {
+      await generatePhoneAppSnapshot('schedule', context.ownerUid, context.charId)
+      await renderPhoneSchedulePage(scroll, context)
+    } catch (e) {
+      window.toast?.(e.message || '生成失败，请重试')
+      btn.disabled = false
+      btn.textContent = old
+    }
+  })
+}
+
+async function openPhoneSchedulePage(context) {
+  const page = createPhoneAppPage('phone-app-schedule-page', '日程')
+  await renderPhoneSchedulePage(page.querySelector('.phone-app-scroll'), context)
+  window.openPage(page)
+}
+
 const PHONE_GEN_APP_OPENERS = {
   browser: openPhoneBrowserPage,
   notes: openPhoneNotesPage,
   photos: openPhonePhotosPage,
   'game-center': openPhoneGameCenterPage,
   privacy: openPhonePrivacyPage,
-  mail: openPhoneMailPage
+  mail: openPhoneMailPage,
+  schedule: openPhoneSchedulePage
 }
 
 async function openPhoneAppPage(appId, context) {

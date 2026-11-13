@@ -41,7 +41,8 @@ const PHONE_RECORDS_GRID_APPS = [
   { id: 'photos', label: '相册', icon: 'fa-solid fa-panorama' },
   { id: 'wallet', label: '钱迹', icon: 'fa-brands fa-apple-pay' },
   { id: 'game-center', label: 'Game Center', icon: 'fa-solid fa-chess' },
-  { id: 'privacy', label: '隐私空间', svg: getPhonePornhubSVG() }
+  { id: 'privacy', label: '隐私空间', svg: getPhonePornhubSVG() },
+  { id: 'schedule', label: '日程', icon: 'fa-solid fa-calendar-days' }
 ]
 
 function createPhoneRecordsPersonalization() {

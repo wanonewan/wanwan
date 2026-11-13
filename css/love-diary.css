@@ -1,0 +1,808 @@
+/* love-diary.css - 恋爱记 页面样式（沿用 iCity 的圆角、字号、留白） */
+
+/* 弹窗是挂在 #app 下的，不在 .ld-page 里面，所以颜色变量也要给弹窗定义一份，否则确认图标/保存按钮的背景会变透明 */
+.ld-page,
+.center-modal.ld-modal {
+  --ld-accent: #e58ca0;
+  --ld-line: #f0d4da;
+  --ld-soft: #fdf3f5;
+}
+
+.ld-header-action,
+.ld-header-spacer {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+}
+
+.ld-header-action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--c-sub);
+  font-size: 16px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-header-action[hidden] {
+  display: none;
+}
+
+.ld-header-action:active {
+  background: var(--c-surface);
+}
+
+/* ===== 顶部：左边角色 / 右边用户 ===== */
+.ld-people {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 16px 12px 6px;
+}
+
+.ld-person {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.ld-person-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #dbe3ee;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7c8aa0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.ld-person-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.ld-person-name {
+  max-width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+  color: #3a3a3c;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ld-empty i {
+  color: var(--ld-line);
+}
+
+/* ===== 时间轴 ===== */
+.ld-timeline {
+  position: relative;
+  padding: 10px 0 48px;
+}
+
+.ld-timeline::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--ld-line);
+}
+
+.ld-item {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 24px 1fr;
+  align-items: start;
+  margin: 14px 0;
+}
+
+.ld-side {
+  min-width: 0;
+}
+
+.ld-side-left {
+  padding: 0 2px 0 12px;
+}
+
+.ld-side-right {
+  padding: 0 12px 0 2px;
+}
+
+.ld-dot {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  margin-top: 16px;
+  justify-self: center;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid var(--ld-accent);
+}
+
+.ld-card {
+  position: relative;
+  padding: 10px 12px;
+  border: 1px solid #f1e3e6;
+  border-radius: 12px;
+  background: #fff;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 0.15s ease;
+}
+
+.ld-right .ld-card {
+  background: var(--ld-soft);
+}
+
+.ld-card:active {
+  background: #fafbfc;
+}
+
+/* 卡片到轴上圆点的小连线 */
+.ld-left .ld-card::after,
+.ld-right .ld-card::after {
+  content: '';
+  position: absolute;
+  top: 20px;
+  width: 9px;
+  height: 2px;
+  background: var(--ld-line);
+}
+
+.ld-left .ld-card::after {
+  right: -10px;
+}
+
+.ld-right .ld-card::after {
+  left: -10px;
+}
+
+.ld-card-date {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ld-accent);
+}
+
+.ld-card-text {
+  margin-top: 6px;
+  font-size: 14px;
+  line-height: 1.55;
+  color: #2a2a2c;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 6;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.ld-card-foot {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #b4b8bf;
+}
+
+/* ===== 详情页 ===== */
+.ld-detail-body {
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+}
+
+.ld-detail-card {
+  padding: 20px 22px 16px;
+}
+
+.ld-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ld-detail-avatar {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: #dbe3ee;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7c8aa0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.ld-detail-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.ld-detail-author {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ld-detail-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1c1c1e;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ld-detail-date {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ld-accent);
+}
+
+.ld-detail-content {
+  margin-top: 18px;
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.6;
+  color: #1c1c1e;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* ===== 备注（仿 iCity 小纸条） ===== */
+.ld-notes {
+  flex: 1;
+  border-top: 8px solid #f6f7f9;
+  padding: 16px 22px 6px;
+}
+
+.ld-notes-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #1c1c1e;
+  margin-bottom: 10px;
+}
+
+.ld-notes-empty {
+  padding: 12px 0 18px;
+  font-size: 13px;
+  color: #b4b8bf;
+}
+
+.ld-note {
+  position: relative;
+  padding: 11px 0;
+  border-top: 1px solid #f0f0f2;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.ld-notes-title + .ld-note {
+  border-top: none;
+}
+
+.ld-note-main {
+  min-width: 0;
+}
+
+.ld-note-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+}
+
+.ld-note-meta > span:first-child {
+  display: block;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--ld-accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ld-note-reply-word {
+  color: var(--c-sub);
+}
+
+.ld-note-btns {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ld-note-btns button {
+  border: none;
+  background: transparent;
+  padding: 2px 0;
+  font-size: 12px;
+  color: var(--ld-accent);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-note-comment {
+  font-size: 14px;
+  line-height: 1.55;
+  color: #2a2a2c;
+  word-break: break-word;
+  white-space: pre-wrap;
+  border-radius: 4px;
+}
+
+.ld-note-comment:active {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.ld-note-action-menu {
+  position: absolute;
+  top: -8px;
+  left: 50%;
+  width: min(128px, calc(100vw - 118px));
+  height: 34px;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+  display: flex;
+  align-items: center;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -100%) scale(0.98);
+  transform-origin: center bottom;
+  transition: opacity 0.14s var(--ease), transform 0.14s var(--ease);
+  overflow: hidden;
+  z-index: 26;
+}
+
+.ld-note.show-note-menu .ld-note-action-menu {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, -100%) scale(1);
+}
+
+.ld-note-action-menu button {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: none;
+  background: transparent;
+  color: var(--c-text);
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-note-action-menu button + button {
+  border-left: 1px solid var(--c-border);
+}
+
+.ld-note-action-menu button:active {
+  background: var(--c-surface);
+}
+
+/* TA 正在回复：三点跳动 */
+.ld-typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+}
+
+.ld-typing i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #d8a3af;
+  animation: ld-bounce 1.2s infinite ease-in-out;
+}
+
+.ld-typing i:nth-child(2) { animation-delay: 0.15s; }
+.ld-typing i:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes ld-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+  30% { transform: translateY(-5px); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ld-typing i { animation: none; opacity: 0.8; }
+}
+
+/* ===== 底部操作栏 ===== */
+.ld-detail-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 14px 8px;
+  border-top: 1px solid #ececec;
+}
+
+.ld-detail-action {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  background: transparent;
+  padding: 4px 0;
+  font-size: 14px;
+  color: #9a9ea6;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-detail-action i {
+  font-size: 17px;
+  line-height: 1;
+  color: #b4b8bf;
+}
+
+.ld-detail-action:active {
+  opacity: 0.6;
+}
+
+.ld-detail-action:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ld-detail-action-more {
+  flex: 0 0 auto;
+  padding: 4px 18px;
+}
+
+.ld-detail-divider {
+  width: 1px;
+  height: 20px;
+  background: #ececec;
+  flex-shrink: 0;
+}
+
+.ld-action-menu {
+  position: fixed;
+  z-index: 500;
+  display: flex;
+  overflow: hidden;
+  border-radius: 10px;
+  background: rgba(44, 44, 44, 0.92);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.16);
+}
+
+.ld-action-menu button {
+  min-width: 62px;
+  height: 42px;
+  padding: 0 14px;
+  border: none;
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-action-menu button:last-child {
+  border-right: none;
+}
+
+.ld-action-menu button:active {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* ===== 弹窗：新增事件 / 写备注 ===== */
+.ld-modal {
+  padding: 18px;
+}
+
+.ld-modal-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: #1c1c1e;
+  margin-bottom: 12px;
+}
+
+.ld-field-label {
+  display: block;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #5a6472;
+}
+
+.ld-field-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #b4b8bf;
+}
+
+.ld-date-input,
+.ld-text-input {
+  width: 100%;
+  border: 1px solid var(--c-border-m);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  outline: none;
+  font-size: 15px;
+  color: #1c1c1e;
+  font-family: inherit;
+  background: #fbfcfe;
+}
+
+.ld-date-input {
+  height: 40px;
+}
+
+.ld-text-input {
+  min-height: 96px;
+  resize: none;
+  line-height: 1.5;
+}
+
+.ld-text-input::placeholder {
+  color: #b4b8bf;
+}
+
+.ld-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.ld-btn-cancel,
+.ld-btn-ok {
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--c-border-m);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-btn-cancel {
+  background: #fff;
+  color: var(--c-sub);
+}
+
+.ld-btn-ok {
+  border-color: var(--ld-accent);
+  background: var(--ld-accent);
+  color: #fff;
+}
+
+.ld-btn-ok:disabled {
+  border-color: #f0d4da;
+  background: #f0d4da;
+  cursor: default;
+}
+
+/* ===== 日记联动开关 ===== */
+.ld-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 18px 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--ld-soft);
+}
+
+.ld-auto-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #8a8f99;
+}
+
+.ld-switch {
+  position: relative;
+  flex-shrink: 0;
+  width: 40px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: #e3e6ea;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  transition: transform 0.15s ease;
+}
+
+.ld-switch.is-on {
+  background: var(--ld-accent);
+}
+
+.ld-switch.is-on i {
+  transform: translateX(16px);
+}
+
+/* ===== 报错弹窗 ===== */
+.ld-actions-one {
+  grid-template-columns: 1fr;
+}
+
+.ld-error-msg {
+  font-size: 14px;
+  line-height: 1.6;
+  color: #3a3a3c;
+  word-break: break-word;
+}
+
+.ld-error-detail {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #8a8f99;
+}
+
+.ld-error-detail summary {
+  cursor: pointer;
+}
+
+.ld-error-detail pre {
+  max-height: 180px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f6f7f9;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ===== 翻记忆按钮 ===== */
+.ld-pick-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: calc(100% - 36px);
+  height: 36px;
+  margin: 8px 18px 0;
+  border: 1px solid var(--ld-line);
+  border-radius: 12px;
+  background: #fff;
+  color: var(--ld-accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-pick-btn:active {
+  background: var(--ld-soft);
+}
+
+.ld-pick-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ===== 日记联动检定记录 ===== */
+.ld-check-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  margin: 6px 18px 0;
+}
+
+.ld-check-line {
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #b4b8bf;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-check-run {
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  color: var(--ld-accent);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-check-run:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ===== 弹窗：标题行的确认图标 + 小窗口可滚动 ===== */
+.center-modal.ld-modal {
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.ld-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ld-title-ok {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  background: var(--ld-accent);
+  color: #fff;
+  font-size: 15px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ld-title-ok:disabled {
+  background: #f0d4da;
+  cursor: default;
+}
+
+@media (max-height: 640px) {
+  .ld-text-input { min-height: 64px; }
+}

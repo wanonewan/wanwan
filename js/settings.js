@@ -21,6 +21,7 @@ var SETTINGS_HTML =
     buildAboutSection() +
     buildNotifSection() +
     buildApiSection() +
+    buildScheduleSection() +
     buildAppearanceSection() +
     buildOnlineSection() +
     buildDataSection() +
@@ -70,6 +71,12 @@ function buildApiSection() {
       '<span class="row-value" id="val-minimax-config">未配置</span>' +
       '<i class="fa fa-angle-right row-chevron"></i>' +
     '</div>' +
+    '<div class="list-row clickable" id="row-fish-config">' +
+      '<div class="row-icon-box"><i class="fa-solid fa-fish"></i></div>' +
+      '<div class="row-body"><div class="row-label">Fish Audio 语音配置</div></div>' +
+      '<span class="row-value" id="val-fish-config">未配置</span>' +
+      '<i class="fa fa-angle-right row-chevron"></i>' +
+    '</div>' +
     '<div class="list-row clickable" id="row-image-gen-config">' +
       '<div class="row-icon-box"><i class="fa-solid fa-image"></i></div>' +
       '<div class="row-body"><div class="row-label">IMAGE 图像配置</div></div>' +
@@ -92,6 +99,11 @@ function openMinimaxConfigPage() {
   }).join('')
   var html =
     '<div class="setting-section"><div class="api-form" id="minimax-form">' +
+      '<label class="form-label">当前使用的语音服务</label>' +
+      '<select class="input-field" id="tts-provider-select">' +
+        '<option value="minimax">Minimax</option>' +
+        '<option value="fish">Fish Audio</option>' +
+      '</select>' +
       '<label class="form-label">API 版本</label>' +
       '<select class="input-field" id="minimax-version">' +
         '<option value="domestic">官方版（api.minimax.chat）</option>' +
@@ -125,8 +137,11 @@ async function initMinimaxConfigPage(page) {
     db.config.get('minimaxVersion'),
     db.config.get('minimaxGroupId'),
     db.config.get('minimaxApiKey'),
-    db.config.get('minimaxModel')
+    db.config.get('minimaxModel'),
+    db.config.get('ttsProvider')
   ])
+  var providerEl = page.querySelector('#tts-provider-select')
+  if (providerEl) providerEl.value = (results[4] && results[4].value === 'fish') ? 'fish' : 'minimax'
   var versionEl = page.querySelector('#minimax-version')
   var groupIdEl = page.querySelector('#minimax-group-id')
   var apiKeyEl = page.querySelector('#minimax-api-key')
@@ -149,13 +164,503 @@ async function initMinimaxConfigPage(page) {
         db.config.put({ key: 'minimaxVersion', value: versionEl.value }),
         db.config.put({ key: 'minimaxGroupId', value: groupIdEl.value.trim() }),
         db.config.put({ key: 'minimaxApiKey', value: apiKeyEl.value.trim() }),
-        db.config.put({ key: 'minimaxModel', value: modelEl.value })
+        db.config.put({ key: 'minimaxModel', value: modelEl.value }),
+        db.config.put({ key: 'ttsProvider', value: providerEl ? providerEl.value : 'minimax' })
       ])
       var settingsPage = document.getElementById('settings-page')
       if (settingsPage) await updateRowValues(settingsPage)
       window.toast('Minimax 语音配置已保存')
     } catch (error) {
       window.toast('Minimax 语音配置保存失败：' + (error.message || error))
+    }
+  })
+}
+
+// ===== 课表导入（ICS）=====
+// 课表时间按下面这个时区的“墙上时间”理解（学校导出的 ICS 里是 +0800）。人在别的时区时改这里。
+var SCHEDULE_TZ = 'Asia/Shanghai'
+var SCHEDULE_TZ_OFFSET_HOURS = 8 // 仅用于把 ICS 里以 Z 结尾的 UTC 时间换算成课表时区
+var SCHEDULE_KEY = 'userSchedule'
+var SCHEDULE_WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
+var ICS_DAY_CODES = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 }
+var ICS_DAY_NAMES = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA']
+var SCHEDULE_MAX_EVENTS = 800
+
+function buildScheduleSection() {
+  return '<div class="setting-section">' +
+    '<div class="list-row clickable" id="row-schedule">' +
+      '<div class="row-icon-box"><i class="fa-solid fa-calendar-days"></i></div>' +
+      '<div class="row-body"><div class="row-label">课表导入</div></div>' +
+      '<span class="row-value" id="val-schedule">未导入</span>' +
+      '<i class="fa fa-angle-right row-chevron"></i>' +
+    '</div>' +
+  '</div>'
+}
+
+function schedDayMs(day) {
+  var m = String(day).match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : NaN
+}
+function schedFmtDay(ms) { return new Date(ms).toISOString().slice(0, 10) }
+function schedDow(ms) { return new Date(ms).getUTCDay() }
+function schedAddDays(day, n) { return schedFmtDay(schedDayMs(day) + n * 86400000) }
+function schedEsc(t) {
+  return String(t == null ? '' : t).replace(/[&<>"']/g, function(c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  })
+}
+
+function icsSplitProp(line) {
+  var inQuote = false
+  for (var i = 0; i < line.length; i++) {
+    var ch = line.charAt(i)
+    if (ch === '"') inQuote = !inQuote
+    else if (ch === ':' && !inQuote) return [line.slice(0, i), line.slice(i + 1)]
+  }
+  return null
+}
+
+function icsText(v) {
+  return String(v || '').replace(/\\[nN]/g, ' ').replace(/\\,/g, ',').replace(/\\;/g, ';').replace(/\\\\/g, '\\').trim()
+}
+
+function icsParseDT(v) {
+  var m = String(v || '').trim().match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?)?(Z)?$/)
+  if (!m) return null
+  var y = +m[1], mo = +m[2], d = +m[3]
+  var hh = m[4] ? +m[4] : 0, mi = m[5] ? +m[5] : 0
+  if (m[7] === 'Z') {
+    var ms = Date.UTC(y, mo - 1, d, hh, mi) + SCHEDULE_TZ_OFFSET_HOURS * 3600000
+    var dt = new Date(ms)
+    return {
+      date: dt.toISOString().slice(0, 10),
+      time: ('0' + dt.getUTCHours()).slice(-2) + ':' + ('0' + dt.getUTCMinutes()).slice(-2),
+      allDay: false
+    }
+  }
+  return {
+    date: m[1] + '-' + m[2] + '-' + m[3],
+    time: ('0' + hh).slice(-2) + ':' + ('0' + mi).slice(-2),
+    allDay: !m[4]
+  }
+}
+
+// 解析 ICS 文本（兼容只用 \r 换行的文件，比如 Outlook 导出的）
+function parseICS(text) {
+  var lines = String(text || '').replace(/\r\n|\r|\n/g, '\n').replace(/\n[ \t]/g, '').split('\n')
+  var events = []
+  var cur = null
+  lines.forEach(function(raw) {
+    var line = raw.trim()
+    if (line === 'BEGIN:VEVENT') { cur = { exdates: {} }; return }
+    if (line === 'END:VEVENT') { if (cur) events.push(cur); cur = null; return }
+    if (!cur) return
+    var kv = icsSplitProp(line)
+    if (!kv) return
+    var name = kv[0].split(';')[0].toUpperCase()
+    var value = kv[1]
+    if (name === 'SUMMARY') cur.summary = icsText(value)
+    else if (name === 'LOCATION') cur.location = icsText(value)
+    else if (name === 'UID') cur.uid = value.trim()
+    else if (name === 'DTSTART') cur.dtstart = icsParseDT(value)
+    else if (name === 'DTEND') cur.dtend = icsParseDT(value)
+    else if (name === 'RRULE') {
+      var rule = {}
+      value.split(';').forEach(function(part) {
+        var i = part.indexOf('=')
+        if (i > 0) rule[part.slice(0, i).toUpperCase()] = part.slice(i + 1)
+      })
+      cur.rrule = rule
+    } else if (name === 'EXDATE') {
+      value.split(',').forEach(function(v) {
+        var d = icsParseDT(v)
+        if (d) cur.exdates[d.date] = true
+      })
+    }
+  })
+  return events
+}
+
+// 把一个（可能带重复规则的）事件展开成具体日期，和教程里“按具体日期存”的做法一致
+function icsExpandEvent(ev) {
+  var out = []
+  var start = ev.dtstart
+  var end = ev.dtend
+  if (!start || start.allDay || !ev.summary) return out
+  var endTime = end ? (end.date === start.date ? end.time : '23:59') : start.time
+  if (endTime <= start.time) endTime = '23:59'
+  var uid = ev.uid || (ev.summary + '|' + start.date + '|' + start.time)
+  function push(day) {
+    if (ev.exdates[day]) return
+    out.push({ uid: uid, date: day, start: start.time, end: endTime, name: ev.summary, location: ev.location || '' })
+  }
+  var rule = ev.rrule
+  var startMs = schedDayMs(start.date)
+  if (!rule) { push(start.date); return out }
+
+  var freq = rule.FREQ
+  var interval = Math.max(1, parseInt(rule.INTERVAL || '1', 10) || 1)
+  var count = rule.COUNT ? parseInt(rule.COUNT, 10) : 0
+  var until = rule.UNTIL ? icsParseDT(rule.UNTIL) : null
+  var untilMs = until ? schedDayMs(until.date) : 0
+  var hardEnd = startMs + 2 * 366 * 86400000 // 既没有 COUNT 也没有 UNTIL 时最多展开两年
+  function ok(ms) { return !(untilMs && ms > untilMs) && ms <= hardEnd }
+  var n = 0
+
+  if (freq === 'DAILY') {
+    for (var ms = startMs; ok(ms) && (!count || n < count) && n < 800; ms += interval * 86400000) {
+      push(schedFmtDay(ms)); n++
+    }
+  } else if (freq === 'WEEKLY') {
+    var days = (rule.BYDAY ? rule.BYDAY.split(',') : [ICS_DAY_NAMES[schedDow(startMs)]])
+      .map(function(d) { return ICS_DAY_CODES[d.replace(/^[+-]?\d+/, '')] })
+      .filter(function(d) { return d !== undefined })
+    days.sort(function(a, b) { return ((a + 6) % 7) - ((b + 6) % 7) })
+    var weekStart = startMs - ((schedDow(startMs) + 6) % 7) * 86400000 // 周一
+    for (var w = 0; w < 400; w++) {
+      var wk = weekStart + w * interval * 7 * 86400000
+      var stop = false
+      for (var i = 0; i < days.length; i++) {
+        var dms = wk + ((days[i] + 6) % 7) * 86400000
+        if (dms < startMs) continue
+        if (!ok(dms) || (count && n >= count)) { stop = true; break }
+        push(schedFmtDay(dms)); n++
+      }
+      if (stop) break
+    }
+  } else {
+    push(start.date) // 每月 / 每年等少见规则只取第一次
+  }
+  return out
+}
+
+function scheduleFromICSTexts(texts) {
+  var all = []
+  texts.forEach(function(t) {
+    parseICS(t).forEach(function(ev) { icsExpandEvent(ev).forEach(function(e) { all.push(e) }) })
+  })
+  var seen = {}
+  return all.filter(function(e) {
+    var k = e.date + '|' + e.start + '|' + e.name
+    if (seen[k]) return false
+    seen[k] = true
+    return true
+  }).sort(function(a, b) { return (a.date + a.start).localeCompare(b.date + b.start) })
+}
+
+// 按课程名汇总，用来预览和展示
+function scheduleSummarize(events) {
+  var groups = {}
+  var order = []
+  events.forEach(function(e) {
+    var g = groups[e.name]
+    if (!g) { g = groups[e.name] = { name: e.name, dows: {}, times: {}, locs: {}, count: 0, first: e.date, last: e.date }; order.push(e.name) }
+    g.count++
+    g.dows[schedDow(schedDayMs(e.date))] = true
+    g.times[e.start + '–' + e.end] = true
+    if (e.location) g.locs[e.location] = true
+    if (e.date < g.first) g.first = e.date
+    if (e.date > g.last) g.last = e.date
+  })
+  return order.map(function(name) {
+    var g = groups[name]
+    return {
+      name: g.name,
+      weekdays: Object.keys(g.dows).map(Number).sort().map(function(d) { return '周' + SCHEDULE_WEEKDAYS[d] }).join('、'),
+      times: Object.keys(g.times).join(' / '),
+      locations: Object.keys(g.locs).join(' / '),
+      count: g.count, first: g.first, last: g.last
+    }
+  })
+}
+
+function scheduleSummaryHTML(events) {
+  var list = scheduleSummarize(events)
+  if (!list.length) return '<div style="color:var(--c-hint);font-size:13px;padding:8px 0">没有读到课程</div>'
+  return list.map(function(g) {
+    return '<div style="padding:10px 0;border-top:1px solid var(--c-border)">' +
+      '<div style="font-size:14px;font-weight:600;color:var(--c-text);word-break:break-word">' + schedEsc(g.name) + '</div>' +
+      '<div style="font-size:12px;color:var(--c-sub);margin-top:3px">' + schedEsc(g.weekdays) + ' ' + schedEsc(g.times) +
+        (g.locations ? ' · ' + schedEsc(g.locations) : '') + '</div>' +
+      '<div style="font-size:12px;color:var(--c-hint);margin-top:2px">共 ' + g.count + ' 次 · ' + g.first + ' 至 ' + g.last + '</div>' +
+    '</div>'
+  }).join('')
+}
+
+async function scheduleLoad() {
+  var rec = await db.config.get(SCHEDULE_KEY)
+  var v = rec && rec.value
+  return (v && Array.isArray(v.events)) ? v : { enabled: true, events: [] }
+}
+async function scheduleSave(data) {
+  await db.config.put({ key: SCHEDULE_KEY, value: data })
+}
+
+function openSchedulePage() {
+  var html =
+    '<div class="setting-section"><div class="api-form">' +
+      '<div class="section-desc" style="padding:0 0 10px">' +
+        '从学校教务系统导出的课表 .ics 文件导入，可以一次选多个文件。导入后，聊天和通话时角色会知道你“按课表今天/明天有什么课”。课表只当作计划，角色不会断言你真的在教室。' +
+      '</div>' +
+      '<input type="file" id="sched-file" accept=".ics,.ICS,text/calendar" multiple style="display:none">' +
+      '<button class="btn-pill btn-full" id="btn-sched-pick">选择 ICS 文件</button>' +
+      '<div id="sched-preview"></div>' +
+      '<button class="btn-pill btn-full" id="btn-sched-import" style="margin-top:10px;display:none">确认导入</button>' +
+    '</div></div>' +
+    '<div class="setting-section">' +
+      '<div class="list-row" data-action="toggle">' +
+        '<div class="row-icon-box"><i class="fa-solid fa-bell-concierge"></i></div>' +
+        '<div class="row-body"><div class="row-label">让角色知道我的课表</div></div>' +
+        '<label class="toggle-wrap"><input type="checkbox" id="toggle-sched">' +
+          '<div class="toggle-track"></div><div class="toggle-thumb"></div></label>' +
+      '</div>' +
+    '</div>' +
+    '<div class="setting-section"><div class="api-form">' +
+      '<div class="form-label" id="sched-saved-title">已导入的课程</div>' +
+      '<div id="sched-saved"></div>' +
+      '<button class="btn-pill btn-full" id="btn-sched-clear" style="margin-top:10px;display:none">清空课表</button>' +
+    '</div></div>'
+  var page = buildSubPage('sub-schedule', '课表导入', html)
+  openSubPage(page)
+  initSchedulePage(page)
+}
+
+async function initSchedulePage(page) {
+  var fileEl = page.querySelector('#sched-file')
+  var previewEl = page.querySelector('#sched-preview')
+  var importBtn = page.querySelector('#btn-sched-import')
+  var savedEl = page.querySelector('#sched-saved')
+  var clearBtn = page.querySelector('#btn-sched-clear')
+  var toggle = page.querySelector('#toggle-sched')
+  var pending = null
+
+  async function refreshSaved() {
+    var data = await scheduleLoad()
+    toggle.checked = data.enabled !== false
+    if (data.events.length) {
+      savedEl.innerHTML = scheduleSummaryHTML(data.events)
+      clearBtn.style.display = ''
+    } else {
+      savedEl.innerHTML = '<div style="color:var(--c-hint);font-size:13px;padding:6px 0">还没有导入课表</div>'
+      clearBtn.style.display = 'none'
+    }
+    var settingsPage = document.getElementById('settings-page')
+    if (settingsPage) updateRowValues(settingsPage)
+  }
+  await refreshSaved()
+
+  page.querySelector('#btn-sched-pick').addEventListener('click', function() { fileEl.click() })
+
+  fileEl.addEventListener('change', async function() {
+    var files = Array.prototype.slice.call(fileEl.files || [])
+    fileEl.value = ''
+    if (!files.length) return
+    try {
+      var texts = await Promise.all(files.map(function(f) { return f.text() }))
+      var events = scheduleFromICSTexts(texts)
+      if (!events.length) {
+        pending = null
+        previewEl.innerHTML = '<div style="color:var(--c-hint);font-size:13px;padding:10px 0">没有读到课程。请确认选的是学校导出的 .ics 课表文件。</div>'
+        importBtn.style.display = 'none'
+        return
+      }
+      pending = events
+      previewEl.innerHTML =
+        '<div style="font-size:13px;color:var(--c-sub);padding:12px 0 2px">识别结果（共 ' + events.length + ' 节，确认无误再点下面的按钮）</div>' +
+        scheduleSummaryHTML(events)
+      importBtn.style.display = ''
+    } catch (e) {
+      window.toast('读取课表失败：' + (e.message || e))
+    }
+  })
+
+  importBtn.addEventListener('click', async function() {
+    if (!pending) return
+    try {
+      var data = await scheduleLoad()
+      var newUids = {}
+      pending.forEach(function(e) { newUids[e.uid] = true })
+      // 同一门课（相同 UID）重新导入时，用新的覆盖旧的
+      var kept = data.events.filter(function(e) { return !newUids[e.uid] })
+      var merged = kept.concat(pending).sort(function(a, b) { return (a.date + a.start).localeCompare(b.date + b.start) })
+      if (merged.length > SCHEDULE_MAX_EVENTS) merged = merged.slice(merged.length - SCHEDULE_MAX_EVENTS)
+      data.events = merged
+      data.importedAt = Date.now()
+      await scheduleSave(data)
+      var n = pending.length
+      pending = null
+      previewEl.innerHTML = ''
+      importBtn.style.display = 'none'
+      await refreshSaved()
+      window.toast('已导入 ' + n + ' 节课')
+    } catch (e) {
+      window.toast('导入失败：' + (e.message || e))
+    }
+  })
+
+  toggle.addEventListener('change', async function() {
+    var data = await scheduleLoad()
+    data.enabled = toggle.checked
+    await scheduleSave(data)
+  })
+
+  clearBtn.addEventListener('click', async function() {
+    if (!confirm('确定清空所有已导入的课表吗？')) return
+    await scheduleSave({ enabled: toggle.checked, events: [] })
+    await refreshSaved()
+    window.toast('课表已清空')
+  })
+}
+
+// ===== 注入聊天的课表上下文：每轮只放“今天”，18:00 以后再加“明天” =====
+function scheduleNow() {
+  var parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: SCHEDULE_TZ, year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', hourCycle: 'h23'
+  }).formatToParts(new Date())
+  var o = {}
+  parts.forEach(function(p) { o[p.type] = p.value })
+  function p2(x) { return ('0' + x).slice(-2) }
+  return { date: o.year + '-' + p2(o.month) + '-' + p2(o.day), time: p2(o.hour) + ':' + p2(o.minute) }
+}
+
+function scheduleLines(events, day, nowTime) {
+  var list = events.filter(function(e) { return e.date === day }).sort(function(a, b) { return a.start.localeCompare(b.start) })
+  if (!list.length) return '- 没有排课'
+  return list.map(function(e) {
+    var status = ''
+    if (nowTime) status = nowTime < e.start ? '（稍后）' : (nowTime < e.end ? '（按计划正在进行）' : '（已结束）')
+    return '- ' + e.start + '–' + e.end + ' ' + e.name + (e.location ? '｜' + e.location : '') + status
+  }).join('\n')
+}
+
+window.ScheduleCtx = {
+  build: async function() {
+    try {
+      var data = await scheduleLoad()
+      if (data.enabled === false || !data.events.length) return ''
+      var now = scheduleNow()
+      var last = data.events.reduce(function(m, e) { return e.date > m ? e.date : m }, '')
+      if (last < schedAddDays(now.date, -7)) return '' // 学期已经结束一周以上，不再注入
+      var weekday = function(day) { return '周' + SCHEDULE_WEEKDAYS[schedDow(schedDayMs(day))] }
+      var text = '【课表（用户导入的课程表，只是计划，不代表用户实际到课）】\n' +
+        '今天 ' + now.date + '（' + weekday(now.date) + '），现在 ' + now.time + '：\n' +
+        scheduleLines(data.events, now.date, now.time)
+      if (Number(now.time.slice(0, 2)) >= 18) {
+        var tomorrow = schedAddDays(now.date, 1)
+        text += '\n明天 ' + tomorrow + '（' + weekday(tomorrow) + '）：\n' + scheduleLines(data.events, tomorrow, '')
+      }
+      text += '\n使用方式：只在话题合适时自然提及，不要每句话都说课表；用“按课表/按计划”的说法，不要断言用户此刻真的在教室或已经到课；如果用户说停课、请假或没去，以用户说的为准。'
+      return text
+    } catch (e) {
+      return ''
+    }
+  }
+}
+
+// ===== Fish Audio 语音配置 =====
+var FISH_DEFAULT_BASE = 'https://api.fish.audio'
+var FISH_MODELS = [
+  { value: 's2.1-pro-free', label: 's2.1-pro-free（免费体验）' },
+  { value: 's2.1-pro', label: 's2.1-pro' },
+  { value: 's2-pro', label: 's2-pro' }
+]
+
+function openFishConfigPage() {
+  var modelOptions = FISH_MODELS.map(function(m) {
+    return '<option value="' + m.value + '">' + m.label + '</option>'
+  }).join('')
+  var html =
+    '<div class="setting-section"><div class="api-form" id="fish-form">' +
+      '<label class="form-label">当前使用的语音服务</label>' +
+      '<select class="input-field" id="tts-provider-select">' +
+        '<option value="minimax">Minimax</option>' +
+        '<option value="fish">Fish Audio</option>' +
+      '</select>' +
+      '<label class="form-label">站点（API 地址）</label>' +
+      '<input class="input-field" id="fish-base-url" placeholder="' + FISH_DEFAULT_BASE + '">' +
+      '<label class="form-label">API Key</label>' +
+      '<div class="input-with-toggle">' +
+        '<input class="input-field" id="fish-api-key" type="text" placeholder="输入 Fish Audio API Key">' +
+        '<button class="btn-text-toggle" id="toggle-fish-key-vis">隐藏</button>' +
+      '</div>' +
+      '<label class="form-label">语音模型</label>' +
+      '<select class="input-field" id="fish-model">' +
+        '<option value="">选择模型...</option>' +
+        modelOptions +
+      '</select>' +
+      '<div class="section-desc" style="padding:8px 0 0">' +
+        '站点默认是官方地址 ' + FISH_DEFAULT_BASE + '，如果以后自己搭了转发地址可以改这里。<br>' +
+        '音色 ID 在「聊天设置 → 语音克隆」里按角色设置，可以直接搜索音色。<br>' +
+        '访问 Fish 需要开 VPN。' +
+      '</div>' +
+      '<button class="btn-pill btn-full" id="btn-save-fish">保存</button>' +
+      '<button class="btn-pill btn-full" id="btn-test-fish" style="margin-top:10px">测试连接（查询余额）</button>' +
+    '</div></div>'
+  var page = buildSubPage('sub-fish-config', 'Fish Audio 语音配置', html)
+  openSubPage(page)
+  initFishConfigPage(page)
+}
+
+async function initFishConfigPage(page) {
+  var results = await Promise.all([
+    db.config.get('fishBaseUrl'),
+    db.config.get('fishApiKey'),
+    db.config.get('fishModel'),
+    db.config.get('ttsProvider')
+  ])
+  var providerEl = page.querySelector('#tts-provider-select')
+  var baseEl = page.querySelector('#fish-base-url')
+  var apiKeyEl = page.querySelector('#fish-api-key')
+  var modelEl = page.querySelector('#fish-model')
+  if (providerEl) providerEl.value = (results[3] && results[3].value === 'fish') ? 'fish' : 'minimax'
+  if (baseEl) baseEl.value = (results[0] && results[0].value) || FISH_DEFAULT_BASE
+  if (apiKeyEl && results[1]) apiKeyEl.value = results[1].value || ''
+  if (modelEl && results[2]) modelEl.value = results[2].value || ''
+  bindKeyVisibilityText(page, 'toggle-fish-key-vis', 'fish-api-key')
+
+  page.querySelector('#btn-save-fish').addEventListener('click', async function() {
+    var missing = findMissingSettingsFields([
+      { el: baseEl, label: '站点' },
+      { el: apiKeyEl, label: 'API Key' },
+      { el: modelEl, label: '语音模型' }
+    ])
+    if (showIncompleteSettingsSave(missing, 'Fish Audio 语音配置')) return
+    try {
+      await Promise.all([
+        db.config.put({ key: 'fishBaseUrl', value: baseEl.value.trim().replace(/\/+$/, '') }),
+        db.config.put({ key: 'fishApiKey', value: apiKeyEl.value.trim() }),
+        db.config.put({ key: 'fishModel', value: modelEl.value }),
+        db.config.put({ key: 'ttsProvider', value: providerEl ? providerEl.value : 'minimax' })
+      ])
+      var settingsPage = document.getElementById('settings-page')
+      if (settingsPage) await updateRowValues(settingsPage)
+      window.toast('Fish Audio 语音配置已保存')
+    } catch (error) {
+      window.toast('Fish Audio 语音配置保存失败：' + (error.message || error))
+    }
+  })
+
+  // 测试连接：只查询余额，不会生成语音
+  page.querySelector('#btn-test-fish').addEventListener('click', async function() {
+    var base = (baseEl.value.trim() || FISH_DEFAULT_BASE).replace(/\/+$/, '')
+    var key = apiKeyEl.value.trim()
+    if (!key) { window.toast('请先填写 API Key'); return }
+    window.toast('正在测试连接…')
+    try {
+      var res = await fetch(base + '/wallet/self/api-credit', {
+        headers: { 'Authorization': 'Bearer ' + key }
+      })
+      if (!res.ok) {
+        var detail = ''
+        try { var j = await res.json(); detail = j.message || '' } catch (_) {}
+        window.toast('连接失败 HTTP ' + res.status + (detail ? '：' + detail : ''))
+        return
+      }
+      var data = await res.json()
+      window.toast('连接成功，余额：' + (data.credit != null ? data.credit : '未知'))
+    } catch (error) {
+      window.toast('网络请求失败：可能没开 VPN，或浏览器被跨域（CORS）拦截')
     }
   })
 }
@@ -3725,6 +4230,9 @@ async function loadSettingsValues(page) {
   page.querySelector('#row-notification').addEventListener('click', openNotificationPage)
   page.querySelector('#row-api-config').addEventListener('click', openApiConfigPage)
   page.querySelector('#row-minimax-config').addEventListener('click', openMinimaxConfigPage)
+  page.querySelector('#row-fish-config').addEventListener('click', openFishConfigPage)
+  var schedRow = page.querySelector('#row-schedule')
+  if (schedRow) schedRow.addEventListener('click', openSchedulePage)
   page.querySelector('#row-image-gen-config').addEventListener('click', openImageGenConfigPage)
   page.querySelector('#row-font').addEventListener('click', openFontPage)
   page.querySelector('#row-wallpaper').addEventListener('click', openWallpaperPage)
@@ -3745,10 +4253,28 @@ async function updateRowValues(page) {
   if (valOnline) {
     valOnline.textContent = (onlineServer && onlineServer.value) ? '已配置' : '未配置'
   }
+  var ttsProviderCfg = await db.config.get('ttsProvider')
+  var ttsActive = (ttsProviderCfg && ttsProviderCfg.value === 'fish') ? 'fish' : 'minimax'
   var minimaxModel = await db.config.get('minimaxModel')
   var valMinimax = page.querySelector('#val-minimax-config')
   if (valMinimax) {
-    valMinimax.textContent = (minimaxModel && minimaxModel.value) ? minimaxModel.value : '未配置'
+    valMinimax.textContent = (minimaxModel && minimaxModel.value)
+      ? minimaxModel.value + (ttsActive === 'minimax' ? ' · 使用中' : '')
+      : '未配置'
+  }
+  var valSched = page.querySelector('#val-schedule')
+  if (valSched) {
+    try {
+      var schedData = await scheduleLoad()
+      valSched.textContent = schedData.events.length ? (schedData.events.length + ' 节') : '未导入'
+    } catch (_) {}
+  }
+  var fishModelCfg = await db.config.get('fishModel')
+  var valFish = page.querySelector('#val-fish-config')
+  if (valFish) {
+    valFish.textContent = (fishModelCfg && fishModelCfg.value)
+      ? fishModelCfg.value + (ttsActive === 'fish' ? ' · 使用中' : '')
+      : '未配置'
   }
   var imageGenModel = await db.config.get('imageGenModel')
   var valImageGen = page.querySelector('#val-image-gen-config')

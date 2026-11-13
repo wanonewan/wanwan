@@ -51,7 +51,7 @@
       label: '消息正文与状态',
       items: [
         '.miss-entry-card', '.miss-msg-text', '.miss-msg-text p', '.miss-quote-highlight',
-        '.miss-entry-footer', '.miss-entry-more', '.miss-entry-delete',
+        '.miss-entry-footer', '.miss-entry-speak', '.miss-entry-more', '.miss-entry-delete',
         '.miss-status-card', '.miss-status-card-title', '.miss-status-row',
         '.miss-status-row span', '.miss-status-row strong',
         '.miss-typing-dots', '.miss-typing-dots span'
@@ -250,6 +250,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       statusRegex,
       statusDesc,
       statusFields,
+      proseGuard: raw.proseGuard !== false,
       beautyPresetId: raw.beautyPresetId ? String(raw.beautyPresetId) : '',
       userSubtitle: raw.userSubtitle === undefined || raw.userSubtitle === null
         ? MISS_USER_SUBTITLE_DEFAULT
@@ -432,6 +433,11 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   window.showMissYouPage = async function() {
+    try {
+      const autoCfg = await db.config.get('missAutoSpeak')
+      _missAutoSpeak = autoCfg ? autoCfg.value !== false : true
+    } catch (_) { _missAutoSpeak = true }
+    _missNoVoiceToasted = false
     const page = document.createElement('div')
     page.id = 'miss-you-page'
     page.className = 'full-page miss-page'
@@ -439,6 +445,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       <div class="page-header miss-header">
         <button class="header-back" id="miss-back"><i class="fa fa-angle-left"></i></button>
         <span class="header-title" id="miss-title">想见你</span>
+        <button class="btn-icon miss-autospeak-btn" id="miss-autospeak" type="button" style="display:none"></button>
         <button class="btn-icon miss-settings-btn" id="miss-settings" title="见面设置" style="display:none">
           <i class="fa-solid fa-ellipsis-vertical"></i>
         </button>
@@ -451,6 +458,24 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       const state = page._missState || {}
       if (state.view === 'chat') openMissSettingsPage(page, state.ownerUid, state.chat, state.mode)
     })
+    // 自动朗读开关（右上角）：默认开，点一下关，再点开
+    const autoBtn = page.querySelector('#miss-autospeak')
+    const paintAuto = () => {
+      autoBtn.innerHTML = `<i class="fa-solid ${_missAutoSpeak ? 'fa-volume-high' : 'fa-volume-xmark'}"></i>`
+      autoBtn.title = _missAutoSpeak ? '自动朗读：开' : '自动朗读：关'
+      autoBtn.setAttribute('aria-label', autoBtn.title)
+    }
+    paintAuto()
+    autoBtn.addEventListener('click', async () => {
+      _missAutoSpeak = !_missAutoSpeak
+      paintAuto()
+      try { await db.config.put({ key: 'missAutoSpeak', value: _missAutoSpeak }) } catch (_) {}
+      if (!_missAutoSpeak) stopMissSpeech()
+      window.toast?.(_missAutoSpeak ? '自动朗读已开启' : '自动朗读已关闭，可点每条记录底部的小喇叭')
+    })
+    // iOS 需要在用户点击/触摸里“解锁”一次音频，之后自动朗读才不会被拦
+    page.addEventListener('click', unlockMissAudio, true)
+    page.addEventListener('touchend', unlockMissAudio, true)
     window.openPage(page)
     await renderAccountPicker(page)
   }
@@ -466,6 +491,8 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     if (!btn) return
     const state = page._missState || {}
     btn.style.display = state.view === 'chat' ? 'flex' : 'none'
+    const autoBtn = page.querySelector('#miss-autospeak')
+    if (autoBtn) autoBtn.style.display = state.view === 'chat' ? 'flex' : 'none'
   }
 
   async function handleMissBack(page) {
@@ -668,11 +695,13 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       sendPending = true
       sendButton.disabled = true
       try {
+        const isFirstMessage = !(await getOfflineMessages(ownerUid, chat.id, chat.charId, mode)).length
         await addOfflineMessage(ownerUid, chat.id, chat.charId, mode, 'user', text)
         await refreshOfflineChat(page)
         if (input.value === draft) input.value = ''
         syncMissInputHeight(input, true)
         startOfflineAIReply(page)
+        if (isFirstMessage) promptSuspendActiveReply(page, chat)
         return true
       } catch (error) {
         console.error('[miss-you] 消息发送失败:', error)
@@ -719,10 +748,22 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   async function addOfflineMessage(ownerUid, chatId, charId, mode, role, content) {
-    return await db.offlineChats.add({
+    const row = {
       ownerUid, chatId, charId, mode, role, content,
       createdAt: Date.now()
-    })
+    }
+    // 从旧存档节点重开的见面：新消息沿用原记录的时间线（上一条 +1 分钟），结束时归档时间也回到原来的时间
+    try {
+      const current = await getOfflineMessages(ownerUid, chatId, charId, mode)
+      const last = current[current.length - 1]
+      if (last && last.resumeEndedAt) {
+        row.createdAt = (Number(last.createdAt) || Date.now()) + 60 * 1000
+        row.resumeEndedAt = last.resumeEndedAt
+      }
+    } catch (error) {
+      console.warn('[miss-you] 读取上一条见面记录失败，使用当前时间:', error)
+    }
+    return await db.offlineChats.add(row)
   }
 
   async function refreshOfflineChat(page) {
@@ -771,8 +812,13 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     if (!action) return
     const char = await window.getCharacter(state.chat.charId)
     const display = await getWechatDisplayFor(state.ownerUid, char)
-    const endedAt = Date.now()
-    const sessionId = `meet_${state.ownerUid}_${state.chat.id}_${state.mode}_${endedAt}`
+    // 从旧存档重开的见面：归档时间回到原记录的时间（且不早于最后一条消息）；sessionId 加后缀，避免和原记录、旧记忆混在一起
+    const resumeRow = rows.find(m => m.resumeEndedAt)
+    const lastCreatedAt = Math.max(0, ...rows.map(m => Number(m.createdAt) || 0))
+    const endedAt = resumeRow
+      ? Math.max(Number(resumeRow.resumeEndedAt) || 0, lastCreatedAt + 1000)
+      : Date.now()
+    const sessionId = `meet_${state.ownerUid}_${state.chat.id}_${state.mode}_${endedAt}${resumeRow ? '_r' + Date.now() : ''}`
     const endedTitle = `${display.name} · ${state.mode === 'script' ? '剧本' : '见面'}`
     const settings = await getOfflineSettings(state.ownerUid, state.chat.id, state.mode)
     let summaryResult = null
@@ -804,15 +850,18 @@ ${MISS_BEAUTY_CLASS_TEXT}`
         }
       }
       const summarized = action === 'summary' && !summaryError && summaryResult?.ok
-      await db.offlineChats.bulkPut(rows.map(m => ({
-        ...m,
+      await db.offlineChats.bulkPut(rows.map(m => {
+        const { resumeEndedAt, ...rest } = m
+        return {
+        ...rest,
         sessionId,
         endedAt,
         endedTitle,
         sessionMaskUserId: settings.maskUserId,
         meetSummaryStatus: summarized ? 'summarized' : 'unsummarized',
         meetSummarizedAt: summarized ? Date.now() : null
-      })))
+        }
+      }))
       await refreshOfflineChat(page)
       if (summaryError) {
         window.toast('总结失败，见面已结束，可在过往记录中重新总结')
@@ -821,12 +870,60 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       } else {
         window.toast('已结束此次见面')
       }
+      // 见面结束了：询问是否把微信的主动回复恢复回来
+      promptRestoreActiveReply(page, state.chat)
     } finally {
       _missSummaryPending.delete(key)
       if (endButton) {
         endButton.disabled = false
         endButton.textContent = '结束'
       }
+    }
+  }
+
+  // ===== 见面期间和微信主动回复联动 =====
+  // 见面开始（发出第一条消息）：询问是否先关闭这个聊天的主动回复，避免角色在微信里提前说出“分别之后”的内容。
+  // 见面结束：询问是否恢复。只有用户在开始时点了“关闭”，结束时才会问。
+  async function promptSuspendActiveReply(page, chat) {
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.getChatActiveReplySettings !== 'function' || typeof helpers.setChatActiveReplyEnabled !== 'function') return
+      const cfg = await helpers.getChatActiveReplySettings(chat.id)
+      if (!cfg.enabled) return
+      const choice = await showMeetChoiceModal({
+        title: '见面期间先关闭主动回复？',
+        message: '这次见面还没结束，微信里的主动回复可能会让角色提前说出“分别之后”的内容。要先把这个聊天的主动回复关掉吗？见面结束时会再问你是否恢复。',
+        buttons: [{ value: 'off', label: '关闭主动回复', primary: true }]
+      }, page)
+      if (choice !== 'off') return
+      await helpers.setChatActiveReplyEnabled(chat.id, false)
+      await db.config.put({ key: `missActiveReplyBackup_${chat.id}`, value: { wasEnabled: true, at: Date.now() } })
+      window.toast?.('已关闭主动回复，见面结束时会询问是否恢复')
+    } catch (e) {
+      console.warn('[miss-you] 关闭主动回复失败:', e)
+    }
+  }
+
+  async function promptRestoreActiveReply(page, chat) {
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.getChatActiveReplySettings !== 'function' || typeof helpers.setChatActiveReplyEnabled !== 'function') return
+      const key = `missActiveReplyBackup_${chat.id}`
+      const backup = (await db.config.get(key))?.value
+      if (!backup || !backup.wasEnabled) return
+      const cfg = await helpers.getChatActiveReplySettings(chat.id)
+      if (cfg.enabled) { await db.config.delete(key); return } // 期间已经手动打开了
+      const choice = await showMeetChoiceModal({
+        title: '恢复主动回复？',
+        message: '这次见面已经结束，要把这个聊天的主动回复重新打开吗？',
+        buttons: [{ value: 'on', label: '恢复开启', primary: true }]
+      }, page)
+      await db.config.delete(key) // 只问这一次
+      if (choice !== 'on') return
+      await helpers.setChatActiveReplyEnabled(chat.id, true)
+      window.toast?.('已恢复主动回复')
+    } catch (e) {
+      console.warn('[miss-you] 恢复主动回复失败:', e)
     }
   }
 
@@ -899,7 +996,7 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const name = isUser ? userDisplay.name : display.name
     const avatar = isUser ? userDisplay.avatar : display.avatar
     const parsed = parseMissStatus(msg.content || '', settings)
-    const content = formatOfflineContent(parsed.status ? parsed.text : (msg.content || ''))
+    const content = formatOfflineContent(stripOfflineTags(stripOfflineLabel(parsed.status ? parsed.text : (msg.content || ''))))
     const useConfiguredSubtitles = options.useConfiguredSubtitles === true
     const subtitle = isUser
       ? (useConfiguredSubtitles ? settings?.userSubtitle : MISS_USER_SUBTITLE_DEFAULT)
@@ -928,11 +1025,161 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           <div class="miss-msg-text">${content}</div>
           <div class="miss-entry-footer">
             <span>${myEsc(formatMeetTime(msg.createdAt))}</span>
-            <button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
-            <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>
+            ${options.resumeButton
+              ? (isUser ? '' : '<button type="button" class="miss-entry-speak" title="朗读对白"><i class="fa-solid fa-volume-high"></i></button>') + '<button type="button" class="miss-entry-resume" title="从这里重开"><i class="fa-solid fa-code-branch"></i><span>从这里重开</span></button>'
+              : `${isUser ? '' : '<button type="button" class="miss-entry-speak" title="朗读对白"><i class="fa-solid fa-volume-high"></i></button>'}<button type="button" class="miss-entry-more" title="更多"><i class="fa-solid fa-ellipsis"></i></button>
+            <button type="button" class="miss-entry-delete" title="删除"><i class="fa-regular fa-trash-can"></i></button>`}
           </div>
         </div>
       </article>`
+  }
+
+  // ===== 朗读角色对白（Fish / Minimax，按设置里当前语音服务） =====
+  const MISS_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+  const _missSpeechCache = new Map()
+  let _missSpeechAudio = null
+  let _missSpeechBtn = null
+  let _missAutoSpeak = true // 角色回复后是否自动朗读（默认开，记在 db.config.missAutoSpeak）
+  let _missNoVoiceToasted = false
+  let _missAutoPendingBtn = null // 自动朗读：正在生成、等生成好再覆盖上一段的那个按钮
+  let _missSharedAudio = null // 全程复用同一个 Audio 元素，iOS 上解锁一次后自动播放才不会被拦
+
+  function getMissAudio() {
+    if (!_missSharedAudio) _missSharedAudio = new Audio()
+    return _missSharedAudio
+  }
+
+  function unlockMissAudio() {
+    const a = getMissAudio()
+    // 已经解锁过、正在朗读/生成、或上一次解锁还没结果时，什么都不做。
+    // （以前解锁失败后每次触摸都会把静音文件塞进去，把正在播的朗读顶掉，所以滑动/点输入框会中断）
+    if (a._missUnlocked || a._missUnlocking || _missSpeechAudio || _missAutoPendingBtn) return
+    a._missUnlocking = true
+    try {
+      a.src = MISS_SILENT_WAV
+      const p = a.play()
+      if (p && p.then) {
+        p.then(() => {
+          a._missUnlocked = true
+          a._missUnlocking = false
+          if (!_missSpeechAudio && String(a.src).startsWith('data:audio/wav')) { try { a.pause() } catch (_) {} }
+        }).catch(() => { a._missUnlocking = false })
+      } else {
+        a._missUnlocking = false
+      }
+    } catch (_) { a._missUnlocking = false }
+  }
+
+  function extractOfflineSpeech(text) {
+    const src = String(text || '').replace(/<status>[\s\S]*?<\/status>/gi, '')
+    const re = /“([^”]+)”|「([^」]+)」|『([^』]+)』|"([^"\n]+)"/g
+    const out = []
+    let m
+    while ((m = re.exec(src))) {
+      const t = (m[1] || m[2] || m[3] || m[4] || '').trim()
+      if (t) out.push(t)
+    }
+    return out.join(' ')
+  }
+
+  function stopMissSpeech() {
+    _missAutoPendingBtn = null
+    if (_missSpeechAudio) {
+      try { _missSpeechAudio.pause() } catch (_) {}
+      _missSpeechAudio.onended = null
+      _missSpeechAudio = null
+    }
+    if (_missSpeechBtn) {
+      _missSpeechBtn.classList.remove('is-playing', 'is-loading')
+      _missSpeechBtn = null
+    }
+  }
+
+  async function speakOfflineEntry(page, msgId, btn, opts = {}) {
+    const auto = !!opts.auto
+    if (!auto && _missSpeechBtn === btn) { stopMissSpeech(); return }
+    if (auto && _missSpeechBtn === btn) return
+    const audio = getMissAudio()
+    if (!auto) {
+      // 手动点击：先停掉当前的，并在手势里“解锁”音频，iOS 上异步生成完再播放才不会被拦
+      stopMissSpeech()
+      audio.src = MISS_SILENT_WAV
+      audio.play().catch(() => {})
+      _missSpeechAudio = audio
+      _missSpeechBtn = btn
+      btn.classList.add('is-loading')
+    } else {
+      // 自动朗读：上一段继续播放，新的这段生成好之后再覆盖它（不会因为生成而打断上一段）
+      _missAutoPendingBtn = btn
+      btn.classList.add('is-loading')
+    }
+    const giveUp = () => {
+      if (auto) {
+        btn.classList.remove('is-loading')
+        if (_missAutoPendingBtn === btn) _missAutoPendingBtn = null
+      } else {
+        stopMissSpeech()
+      }
+    }
+    try {
+      const row = await db.offlineChats.get(msgId)
+      if (!row) throw new Error('找不到这条记录')
+      const settings = page?._missState?.settings || await getOfflineSettings(row.ownerUid, row.chatId, row.mode)
+      const parsed = parseMissStatus(row.content || '', settings)
+      const text = extractOfflineSpeech(stripOfflineLabel(parsed.status ? parsed.text : row.content))
+      if (!text) { if (!auto) window.toast?.('这条里没有对白可以朗读'); giveUp(); return }
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.callTTS !== 'function' || typeof helpers.getChatVoiceId !== 'function') {
+        throw new Error('语音功能未加载')
+      }
+      const voiceId = await helpers.getChatVoiceId(row.chatId)
+      if (!voiceId) {
+        if (!auto || !_missNoVoiceToasted) window.toast?.('这个角色还没设置音色 ID（微信聊天设置里填）')
+        if (auto) _missNoVoiceToasted = true
+        giveUp()
+        return
+      }
+      const key = voiceId + '|' + text
+      let url = _missSpeechCache.get(key)
+      if (!url) {
+        url = await helpers.callTTS(text, voiceId)
+        _missSpeechCache.set(key, url)
+        if (_missSpeechCache.size > 20) {
+          const oldest = _missSpeechCache.keys().next().value
+          URL.revokeObjectURL(_missSpeechCache.get(oldest))
+          _missSpeechCache.delete(oldest)
+        }
+      }
+      if (auto) {
+        // 期间被更新的自动朗读、手动停止或关闭自动朗读取代了：放弃这一段
+        if (_missAutoPendingBtn !== btn) { btn.classList.remove('is-loading'); return }
+        _missAutoPendingBtn = null
+        stopMissSpeech() // 上一段到这里才被换掉
+        _missSpeechAudio = audio
+        _missSpeechBtn = btn
+      } else if (_missSpeechBtn !== btn) {
+        return // 期间被点了停止或换了别条
+      }
+      btn.classList.remove('is-loading')
+      btn.classList.add('is-playing')
+      audio.src = url
+      audio.onended = () => { if (_missSpeechBtn === btn) stopMissSpeech() }
+      await audio.play()
+    } catch (e) {
+      if (_missSpeechBtn === btn) stopMissSpeech()
+      else giveUp()
+      if (auto) {
+        // 自动朗读失败不弹大窗，提示一下即可，可以点小喇叭重试
+        console.warn('[miss-you] 自动朗读失败:', e)
+        window.toast?.(e && e.name === 'NotAllowedError'
+          ? '浏览器拦截了自动播放，请点小喇叭手动听'
+          : '自动朗读失败，可点小喇叭重试')
+        return
+      }
+      const msg = '朗读失败：' + (e.message || e)
+      if (typeof showApiErrorModal === 'function') showApiErrorModal(msg)
+      else window.toast?.(msg)
+    }
   }
 
   function bindMissEntryActions(root, page) {
@@ -945,6 +1192,15 @@ ${MISS_BEAUTY_CLASS_TEXT}`
           return
         }
         showMissStatusCard(head, { fields })
+      })
+    })
+    root.querySelectorAll('.miss-entry-speak').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation()
+        const entry = btn.closest('.miss-entry')
+        const id = parseInt(entry?.dataset.msgId, 10)
+        if (!id) return
+        speakOfflineEntry(page, id, btn)
       })
     })
     root.querySelectorAll('.miss-entry-more').forEach(btn => {
@@ -1122,7 +1378,12 @@ ${MISS_BEAUTY_CLASS_TEXT}`
   }
 
   function formatMissQuoteHighlights(html) {
-    return String(html || '').replace(/“([^”]*)”/g, '<span class="miss-quote-highlight">“$1”</span>')
+    // 入参已经过 HTML 转义，所以直引号是 &quot;
+    return String(html || '')
+      .replace(/“([^”]*)”/g, '<span class="miss-quote-highlight">“$1”</span>')
+      .replace(/「([^」]*)」/g, '<span class="miss-quote-highlight">「$1」</span>')
+      .replace(/『([^』]*)』/g, '<span class="miss-quote-highlight">『$1』</span>')
+      .replace(/&quot;(.+?)&quot;/g, '<span class="miss-quote-highlight">&quot;$1&quot;</span>')
   }
 
   function startOfflineAIReply(page, options = {}) {
@@ -1131,12 +1392,14 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const key = pendingKey(state.ownerUid, state.chat.id, state.mode)
     if (_missYouPending.has(key)) return
     _missYouPending.add(key)
+    // 不再在发送时停掉上一条朗读：让它自然播完；新回复生成后自动朗读时会替换它
     applyMissPending(page, true)
     ;(async () => {
       try {
         const reply = await generateOfflineReply(state.ownerUid, state.chat, state.mode, options)
-        await addOfflineMessage(state.ownerUid, state.chat.id, state.chat.charId, state.mode, 'assistant', reply)
+        const newId = await addOfflineMessage(state.ownerUid, state.chat.id, state.chat.charId, state.mode, 'assistant', reply)
         await refreshOfflineChat(page)
+        if (_missAutoSpeak) autoSpeakOfflineReply(page, newId, state)
       } catch (e) {
         if (typeof showApiErrorModal === 'function') showApiErrorModal(e.message || String(e))
         else window.toast('AI 回复失败：' + (e.message || String(e)))
@@ -1145,6 +1408,16 @@ ${MISS_BEAUTY_CLASS_TEXT}`
         applyMissPending(page, false)
       }
     })()
+  }
+
+  function autoSpeakOfflineReply(page, msgId, state) {
+    if (!msgId || !document.body.contains(page)) return
+    const cur = page._missState
+    // 用户中途退出或换了聊天对象就不读了
+    if (!cur || cur.view !== 'chat' || cur.chat.id !== state.chat.id || cur.mode !== state.mode) return
+    const btn = page.querySelector(`.miss-entry[data-msg-id="${msgId}"] .miss-entry-speak`)
+    if (!btn) return
+    speakOfflineEntry(page, msgId, btn, { auto: true })
   }
 
   function applyMissPending(page, isPending) {
@@ -1200,22 +1473,78 @@ ${MISS_BEAUTY_CLASS_TEXT}`
       content: m.content || ''
     }))
     const loreCtx = window.getLorebookContextSegments
-      ? await window.getLorebookContextSegments(chat.charId, recentForLore)
-      : (window.getLorebookContext ? await window.getLorebookContext(chat.charId, recentForLore) : '')
+      ? await window.getLorebookContextSegments(chat.charId, recentForLore, { scene: 'offline' })
+      : (window.getLorebookContext ? await window.getLorebookContext(chat.charId, recentForLore, { scene: 'offline' }) : '')
     const memoryCtx = window.WanWanMemory?.getMemoryContext
       ? await window.WanWanMemory.getMemoryContext(chat.id, chat.charId, ownerUid, timelineContext.loreMessages)
       : ''
     const lastOffline = offlineAll[offlineAll.length - 1]
     const isContinuation = !!(options.preferContinue && lastOffline && lastOffline.role !== 'user')
-    const system = await buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings)
-    const timeline = buildOfflineTimeline(timelineContext.textHistory || [], { isContinuation })
+    // 续写只依据当前这次线下见面的记录；微信聊天/通话/往次见面只作为“背景”放进系统提示，不作为对话上下文
+    const { liveHistory, backgroundText } = splitOfflineContext(timelineContext, offlineAll, char, user)
+    const system = await buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings, backgroundText)
+    let tagReminder = ''
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.isTTSTagEnabled === 'function' && await helpers.isTTSTagEnabled()) {
+        tagReminder = '（提醒：这一条回复里每一句对白的引号内开头都要带一个【语气】标签，例如“【轻声】……”。）'
+      }
+    } catch (_) {}
+    const timeline = buildOfflineTimeline(liveHistory, { isContinuation, tagReminder })
     const raw = await window.callAI(timeline, { system, temperature: await window.getAITemperaturePreset('offlineMode') })
     const reply = cleanOfflineReply(raw)
     if (!reply) throw new Error('AI 返回了空响应，请检查 API 配置或稍后重试')
+    // 套话句式润色：状态栏和对白原样保留，只改命中的叙述行；失败就用原文
+    if (settings.proseGuard !== false && window.ProseGuard) {
+      try {
+        const r = await window.ProseGuard.polishText(reply, {
+          allow: 1,
+          maxUnits: 6,
+          protect: [buildStatusRE(settings), /<status>[\s\S]*?<\/status>/i]
+        })
+        if (r.fixed) return r.text
+      } catch (e) { console.warn('[miss-you] 润色失败，使用原文', e) }
+    }
     return reply
   }
 
-  async function buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings) {
+  // 把统一时间线拆成两部分：
+  // liveHistory   = 当前进行中的这次线下见面（真正续写的对象）
+  // backgroundText = 线上聊天、通话、往次已结束的见面（只作背景）
+  function splitOfflineContext(timelineContext, offlineAll, char, user) {
+    const charName = getOfflinePromptCharName(char)
+    const userName = getOfflinePromptUserName(user)
+    const liveHistory = (offlineAll || [])
+      .map(row => ({
+        role: row.role === 'assistant' ? 'assistant' : 'user',
+        content: stripOfflineLabel(row.content || '').trim()
+      }))
+      .filter(m => m.content)
+    if (liveHistory.length) {
+      liveHistory.unshift({ role: 'user', content: '（以下是你们这次线下见面到目前为止的经过。）' })
+    }
+    const liveTimes = new Set((offlineAll || []).map(row => Number(row.createdAt) || 0))
+    const items = Array.isArray(timelineContext?.timeline) ? timelineContext.timeline : []
+    const texts = Array.isArray(timelineContext?.textHistory) ? timelineContext.textHistory : []
+    const lines = []
+    items.forEach((item, i) => {
+      if (!item) return
+      // 当前这次见面的条目已经放进 liveHistory，这里跳过
+      if (item.kind === 'offline' && liveTimes.has(Number(item.time) || 0)) return
+      const text = String(texts[i]?.content ?? item.content ?? '').trim()
+      if (!text) return
+      if (item.kind === 'online') {
+        lines.push(`${item.role === 'assistant' ? charName : userName}：${text}`)
+      } else if (item.kind === 'offline') {
+        lines.push(stripOfflineLabel(text))
+      } else {
+        lines.push(text) // 通话记录自带格式
+      }
+    })
+    return { liveHistory, backgroundText: lines.join('\n') }
+  }
+
+  async function buildOfflineSystemPrompt(ownerUid, char, user, loreCtx, memoryCtx, offlineAll, settings, backgroundText = '') {
     const charName = getOfflinePromptCharName(char)
     const userName = getOfflinePromptUserName(user)
     const relation = buildRelationText(char, user.id || ownerUid)
@@ -1230,6 +1559,26 @@ ${MISS_BEAUTY_CLASS_TEXT}`
     const memoryBlock = buildOfflineMemoryBlock(memoryCtx)
     const antiRepeatBlock = buildAntiRepeatBlock(offlineAll)
     const narrativeRule = buildNarrativePersonRule(settings.narrativePerson, charName, userName)
+    const proseRule = (settings.proseGuard !== false && window.ProseGuard)
+      ? window.ProseGuard.styleRule({ prefix: '- ', unit: '一条回复', max: 1 })
+      : ''
+    let scheduleRule = ''
+    try {
+      const helpers0 = window._wechatCallHelpers || {}
+      const sched = typeof helpers0.getScheduleContext === 'function' ? await helpers0.getScheduleContext() : ''
+      if (sched) scheduleRule = '\n' + sched + '\n'
+      const charSched = typeof helpers0.getCharScheduleContext === 'function' ? await helpers0.getCharScheduleContext(chat.id, charName) : ''
+      if (charSched) scheduleRule += '\n' + charSched + '\n'
+    } catch (_) {}
+    let ttsTagRule = ''
+    try {
+      const helpers = window._wechatCallHelpers || {}
+      if (typeof helpers.isTTSTagEnabled === 'function' && await helpers.isTTSTagEnabled()) {
+        ttsTagRule = `- 【语气标签（必须遵守）】这条回复里的每一句对白，引号内的开头都必须带 1 个【】语气标签，用于之后朗读，不能省略。标签用中文短语（2-6 个字，按当下情绪具体选，如【轻声】【低声】【轻笑】【叹气】【撒娇】【害羞】【哽咽】【犹豫】【温柔】【打趣】）。标签只写在引号里，旁白、动作和心理描写里不要写。即使前面的见面记录里没有标签，从这一条开始也必须写。
+  正确示例：他低下头，声音很轻。“【低声】我想你了。”过了一会儿又笑起来：“【轻笑】你怎么还是这样。”
+  错误示例（缺少标签）：“我想你了。”\n`
+      }
+    } catch (_) {}
     return `# 想见你线下模式
 
 你扮演【${charName}】，正在和【${userName}】线下真实见面。你不是${userName}，也不是语言模型；你有自己的性格、情绪、边界和判断。
@@ -1258,10 +1607,11 @@ ${memoryBlock}
 ${antiRepeatBlock}
 
 ## 上下文
-- 微信聊天和线下见面属于同一条连续时间线；记住两边发生过的事，自然承接最近上下文。
-- 当前场景只发生在线下。若历史里出现“之后你们在微信上聊天/线下见面了”等转场提示，只用于理解时间线，不要复述。
+- 对话消息里只有【当前这次线下见面】的经过，请只顺着它续写；若还没有任何线下记录，就当作一次新的见面开场。
+- 微信聊天、语音/视频通话和往次见面只是背景：用来了解你们的近况、关系和情绪，不是当前场景。不要接着通话或聊天的最后一句往下说，不要把通话/聊天里的情境当成正在发生，也不要复述其中的内容。
+- 当前的地点、动作和话题以线下记录为准，不受线上内容影响。
 - 可以感知并回应现场的表情、距离、停顿、视线、手部动作、身体姿态和环境细节。
-
+${backgroundText ? `\n## 线上背景（仅作背景，按时间从早到晚）\n${backgroundText}\n` : ''}
 ${loreAfterBlock}## 回复规则
 - AI必须在每次回复的最开头，强制附加以下结构化状态数据，然后再输出正文：
 <status>
@@ -1271,13 +1621,15 @@ ${settings.statusFormat}
 - 只输出${charName}这一轮回应，不替${userName}说话或新增${userName}动作。
 - ${settings.minWords}-${settings.maxWords}个中文字符；每次都推进动作、情绪、话题或关系张力。
 - ${narrativeRule}
-- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
+- 对白一律用中文弯引号“”包裹（不要用直引号 " 或「」）。
+- 不要输出“线下见面中，角色：”这类前缀，直接写正文。
+${ttsTagRule}${scheduleRule}- 必须同时包含动作描写、神态描写和心理活动；动作与对白分段换行，不要堆成一行。
 - 允许符合人设和关系的自然肢体互动，不能突兀升级，也不能无条件讨好${userName}。
 
 ## 禁止
 - 禁止微信表情包、图片、语音、红包、转账、朋友圈、聊天气泡等网络元素。
 - 禁止重复已出现过的动作、台词、描写、场景和句式；避免让回复像之前内容的改写。
-- 除开头固定<status>结构外，禁止输出 JSON、Markdown、标题、解释、方括号前缀或元标记，如[微信消息]、[线下]、[旁白]、[系统]、[动作]。`
+- 除开头固定<status>结构外，禁止输出 JSON、Markdown、标题、解释、方括号前缀或元标记，如[微信消息]、[线下]、[旁白]、[系统]、[动作]。${proseRule ? '\n' + proseRule : ''}`
   }
 
   function buildNarrativePersonRule(narrativePerson, charName, userName) {
@@ -1331,7 +1683,7 @@ ${memoryCtx}`
       content: m.content || ''
     }))
     const loreCtx = window.getLorebookContext
-      ? await window.getLorebookContext(chat.charId, recentForLore)
+      ? await window.getLorebookContext(chat.charId, recentForLore, { scene: 'offline' })
       : ''
     const char = await window.getCharacter(chat.charId)
     const user = await getMaskUser(ownerUid, chat.id, mode)
@@ -1464,6 +1816,15 @@ ${memoryCtx}`
         </div>
 
         <div class="cs-section">
+          <div class="cs-section-label">文风</div>
+          <div class="cs-section-sub">改掉“不是…而是…”“怎么…怎么…”这类套话句式。只有检测到时才多调用一次 AI，只改命中的那几行</div>
+          <label class="miss-field-label" style="display:flex;flex-direction:row;align-items:center;gap:8px">
+            <input type="checkbox" id="miss-prose-guard" ${settings.proseGuard !== false ? 'checked' : ''}>
+            <span>自动润色套话句式</span>
+          </label>
+        </div>
+
+        <div class="cs-section">
           <div class="cs-section-label">页面美化</div>
           <div class="cs-section-sub">仅应用到当前 live 见面页面，不影响历史记录和其他页面</div>
           <label class="miss-field-label">
@@ -1532,6 +1893,7 @@ ${memoryCtx}`
       const userSubtitle = page.querySelector('#miss-user-subtitle').value
       const charSubtitle = page.querySelector('#miss-char-subtitle').value
       const beautyPresetId = page.querySelector('input[name="miss-beauty-preset"]:checked')?.value || ''
+      const proseGuard = !!page.querySelector('#miss-prose-guard')?.checked
       await saveOfflineSettings(ownerUid, chat.id, mode, {
         minWords,
         maxWords,
@@ -1542,7 +1904,8 @@ ${memoryCtx}`
         statusDesc,
         userSubtitle,
         charSubtitle,
-        beautyPresetId
+        beautyPresetId,
+        proseGuard
       })
       await refreshOfflineChat(chatPage)
       await applyMissBeauty(chatPage, ownerUid, chat.id, mode)
@@ -1906,12 +2269,66 @@ ${memoryCtx}`
         <button class="header-back" id="miss-record-back"><i class="fa fa-angle-left"></i></button>
         <span class="header-title">${myEsc(formatMeetTime(record.endedAt))}</span>
         ${record.summarized ? '' : '<button class="btn-icon miss-record-summary-btn" id="miss-record-summary" type="button" title="总结此次见面" aria-label="总结此次见面"><i class="fa-solid fa-wand-magic-sparkles"></i></button>'}
+        <button class="btn-icon miss-record-delete-btn" id="miss-record-delete" type="button" title="删除此记录" aria-label="删除此记录"><i class="fa-regular fa-trash-can"></i></button>
       </div>
       <div class="miss-record-detail">
-        ${record.messages.map((m, i) => buildOfflineMsgHTML(m, userDisplay, display, i, settings)).join('')}
+        ${record.messages.map((m, i) => buildOfflineMsgHTML(m, userDisplay, display, i, settings, { resumeButton: true })).join('')}
       </div>
     `
     page.querySelector('#miss-record-back').addEventListener('click', () => window.closePage('miss-you-record-page'))
+    page.querySelector('#miss-record-delete').addEventListener('click', async () => {
+      const choice = await showMeetChoiceModal({
+        title: '删除这条见面记录？',
+        message: `将删除这 ${record.count} 条见面记录，以及这次见面生成的长期记忆（如果有）。删除后无法恢复。`,
+        buttons: [{ value: 'delete', label: '确认删除', primary: true }]
+      })
+      if (choice !== 'delete') return
+      try {
+        await deleteMeetRecord(ownerUid, chat, record)
+        window.closePage('miss-you-record-page')
+        await refreshMeetRecordList(recordListPage, ownerUid, chat, mode)
+        window.toast('已删除这条见面记录')
+      } catch (error) {
+        console.error('[miss-you] 删除见面记录失败:', error)
+        window.toast('删除失败：' + (error?.message || String(error)))
+      }
+    })
+    page.querySelectorAll('.miss-entry-speak').forEach(btn => {
+      btn.addEventListener('click', event => {
+        event.stopPropagation()
+        const id = parseInt(btn.closest('.miss-entry')?.dataset.msgId, 10)
+        if (id) speakOfflineEntry(page, id, btn)
+      })
+    })
+    page.querySelectorAll('.miss-entry-resume').forEach(btn => {
+      btn.addEventListener('click', async event => {
+        event.stopPropagation()
+        const id = parseInt(btn.closest('.miss-entry')?.dataset.msgId, 10)
+        const nodeIndex = record.messages.findIndex(m => m.id === id)
+        if (nodeIndex < 0) return
+        const choice = await showMeetChoiceModal({
+          title: '从这条重新开始？',
+          message: `将保留这条（含）之前的 ${nodeIndex + 1} 条内容，之后的内容重新写。时间沿用原记录。\n\n覆盖：删除原记录和它生成的长期记忆。\n另存：原记录保留，但前半段会在新旧两份里各有一份，线上聊天和日记会读到重复内容，确认不要原记录后建议删除它。`,
+          buttons: [
+            { value: 'overwrite', label: '覆盖原记录并重开', primary: true },
+            { value: 'branch', label: '另存为新分支（保留原记录）' }
+          ]
+        })
+        if (!choice) return
+        try {
+          const ok = await resumeMeetFromNode(ownerUid, chat, mode, record, nodeIndex, choice === 'overwrite')
+          if (!ok) return
+          window.closePage('miss-you-record-page')
+          window.closePage('miss-you-settings-page')
+          const missPage = document.getElementById('miss-you-page')
+          if (missPage) await refreshOfflineChat(missPage)
+          window.toast(choice === 'overwrite' ? '已覆盖并回到这个节点，可以继续写了' : '已另存为新分支，可以继续写了')
+        } catch (error) {
+          console.error('[miss-you] 从存档重开失败:', error)
+          window.toast('重开失败：' + (error?.message || String(error)))
+        }
+      })
+    })
     page.querySelector('#miss-record-summary')?.addEventListener('click', async event => {
       const button = event.currentTarget
       const pendingKey = `record:${record.sessionId}`
@@ -1949,6 +2366,55 @@ ${memoryCtx}`
       }
     })
     window.openPage(page)
+  }
+
+  // 删除一条见面记录：同时清掉它生成的长期记忆和总结记录，避免角色还"记得"
+  async function deleteMeetRecord(ownerUid, chat, record) {
+    const ids = record.messages.map(m => m.id).filter(Boolean)
+    await removeMeetSessionMemories(ownerUid, chat.id, chat.charId, record.sessionId)
+    if (ids.length) await db.offlineChats.bulkDelete(ids)
+  }
+
+  async function removeMeetSessionMemories(ownerUid, chatId, charId, sessionId) {
+    if (!sessionId) return
+    if (db.memories) {
+      await db.memories.where('chatId').equals(chatId).filter(m =>
+        m.ownerUid === ownerUid && m.charId === charId && m.sourceSessionId === sessionId
+      ).delete()
+    }
+    if (db.memoryRuns) {
+      await db.memoryRuns.where('chatId').equals(chatId).filter(r =>
+        r.ownerUid === ownerUid && r.charId === charId && r.sourceSessionId === sessionId
+      ).delete()
+    }
+  }
+
+  // 从已结束记录的某个节点重开：保留该节点（含）之前的内容，作为新的进行中见面继续写
+  async function resumeMeetFromNode(ownerUid, chat, mode, record, nodeIndex, overwrite) {
+    const key = pendingKey(ownerUid, chat.id, mode)
+    if (_missYouPending.has(key) || _missSummaryPending.has(key) || _missEndModalPending.has(key)) {
+      window.toast('当前正在生成或总结，稍后再试')
+      return false
+    }
+    const current = await getOfflineMessages(ownerUid, chat.id, chat.charId, mode)
+    if (current.length) {
+      window.toast('当前有未结束的见面，请先回到见面页结束或清空后再重开')
+      return false
+    }
+    const keep = record.messages.slice(0, nodeIndex + 1)
+    if (!keep.length) return false
+    const resumeEndedAt = Number(record.endedAt) || Date.now()
+    const rows = keep.map(m => {
+      const {
+        id, sessionId, endedAt, endedTitle, sessionMaskUserId,
+        meetSummaryStatus, meetSummarizedAt, ...rest
+      } = m
+      return { ...rest, resumeEndedAt }
+    })
+    // 先写入新的进行中记录，再删除原记录，中途失败也不会丢数据
+    await db.offlineChats.bulkAdd(rows)
+    if (overwrite) await deleteMeetRecord(ownerUid, chat, record)
+    return true
   }
 
   async function refreshMeetRecordList(page, ownerUid, chat, mode) {
@@ -2014,14 +2480,34 @@ ${summary}
         content: '（续写：请在不新增用户发言的前提下，承接你上一条角色回复继续推进当前线下剧情。不要复述或改写刚发生的动作、台词、情绪或场景，必须引入新的动作、反应、话题或情绪变化，并继续严格遵守系统提示中的状态栏格式、字数、人设和禁忌。）'
       })
     }
+    if (options.tagReminder) {
+      result.push({ role: 'user', content: options.tagReminder })
+    }
     return result
   }
 
+  // 微信时间线里线下记录带有“线下见面中，角色：”前缀，模型有时会照抄；这里统一去掉
+  const MISS_OFFLINE_LABEL_RE = /线下见面中[，,]\s*(?:角色|用户)\s*[：:]\s*/g
+
+  function stripOfflineLabel(text) {
+    return String(text || '').replace(MISS_OFFLINE_LABEL_RE, '')
+  }
+
+  // 对白里的【语气】标签只给朗读用，显示时去掉（存档里保留）
+  function stripOfflineTags(text) {
+    const rm = str => str.replace(/【[^】\n]{1,30}】/g, '')
+    return String(text || '')
+      .replace(/“([^”]*)”/g, (m, inner) => '“' + rm(inner) + '”')
+      .replace(/「([^」]*)」/g, (m, inner) => '「' + rm(inner) + '」')
+      .replace(/『([^』]*)』/g, (m, inner) => '『' + rm(inner) + '』')
+      .replace(/"([^"\n]*)"/g, (m, inner) => '"' + rm(inner) + '"')
+  }
+
   function cleanOfflineReply(raw) {
-    return String(raw || '')
+    return stripOfflineLabel(String(raw || '')
       .trim()
       .replace(/^```(?:text|markdown)?\s*/i, '')
-      .replace(/```$/i, '')
+      .replace(/```$/i, ''))
       .trim()
   }
 })()

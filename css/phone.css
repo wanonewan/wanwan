@@ -51,6 +51,9 @@
     radial-gradient(ellipse at 50% 30%, rgba(255, 255, 255, 0.6), transparent 60%),
     radial-gradient(ellipse at 80% 80%, rgba(200, 200, 200, 0.15), transparent 50%),
     linear-gradient(160deg, #f0f0f0 0%, #e8e8e8 30%, #f5f5f5 50%, #eaeaea 70%, #f2f2f2 100%);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 /* 锁屏时间 */
@@ -350,6 +353,9 @@
     radial-gradient(ellipse at 30% 25%, rgba(255, 255, 255, 0.5), transparent 55%),
     radial-gradient(ellipse at 75% 75%, rgba(220, 220, 220, 0.2), transparent 50%),
     linear-gradient(155deg, #f2f2f2 0%, #eaeaea 40%, #f0f0f0 60%, #e6e6e6 80%, #f4f4f4 100%);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
 }
 
 /* 主页头部用户信息 */
@@ -896,7 +902,7 @@
 
 .phone-wallpaper-preview {
   position: relative;
-  aspect-ratio: 1;
+  aspect-ratio: 9 / 19.5;
   width: 100%;
   overflow: hidden;
   border-radius: 18px;
@@ -910,6 +916,7 @@
   background: #d8d8d8;
   background-size: cover;
   background-position: center;
+  background-repeat: no-repeat;
 }
 
 .phone-wallpaper-pick {
@@ -1997,3 +2004,68 @@ button.phone-mail-row:active {
 .phone-mail-attachment-size {
   color: var(--c-hint);
 }
+
+/* ===== 角色手机：日程 ===== */
+.phone-sch-card {
+  margin: 8px 16px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: var(--c-surface);
+  border: 1px solid transparent;
+}
+.phone-sch-card.is-today { border-color: var(--c-border-m); }
+.phone-sch-date {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--c-text);
+}
+.phone-sch-item {
+  display: flex;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--c-border);
+}
+.phone-sch-card > .phone-sch-item:first-child { border-top: none; }
+.phone-sch-time {
+  flex: 0 0 96px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+.phone-sch-main { flex: 1; min-width: 0; }
+.phone-sch-title { font-size: 14px; line-height: 1.5; color: var(--c-text); word-break: break-word; }
+.phone-sch-sub { margin-top: 2px; font-size: 12px; line-height: 1.5; color: var(--c-hint); word-break: break-word; }
+.phone-sch-tag {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 7px;
+  border-radius: 8px;
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 18px;
+  color: var(--c-sub);
+}
+.phone-sch-empty { padding: 10px 0; font-size: 13px; color: var(--c-hint); text-align: center; }
+.phone-sch-gen {
+  display: block;
+  width: calc(100% - 32px);
+  height: 40px;
+  margin: 16px 16px 6px;
+  border-radius: 12px;
+  border: 1px solid var(--c-border-m);
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.phone-sch-gen:disabled { opacity: 0.6; cursor: default; }
+.phone-sch-hint { margin: 0 16px 24px; font-size: 12px; line-height: 1.5; color: var(--c-hint); }

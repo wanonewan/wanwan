@@ -15,6 +15,9 @@ var SVG_ICONS = {
   visualnovel: '<svg viewBox="0 0 1154 1024" xmlns="http://www.w3.org/2000/svg"><path d="M385.260683 1024l-17.056996-1.175038c-31.953439-2.122648-63.679452-5.685665-94.419949-15.161774a301.757211 301.757211 0 0 1-52.004886-23.652367 264.042298 264.042298 0 0 1-50.185472-32.863146 158.213114 158.213114 0 0 1-16.185194-16.867474 41.694879 41.694879 0 0 1-9.05916-26.533105 123.341033 123.341033 0 0 1 9.097064-47.570066 353.345148 353.345148 0 0 1 35.630169-68.796551 1114.390404 1114.390404 0 0 1 99.878188-135.167217 732.541121 732.541121 0 0 1 135.697879-121.597429 578.080546 578.080546 0 0 1 80.812257-45.902271 17.246518 17.246518 0 0 1 15.427105-0.227427 79.864646 79.864646 0 0 1 22.287808 16.412621 263.2084 263.2084 0 0 1 40.860981 54.317056 587.51875 587.51875 0 0 1 69.137691 176.445147 298.876474 298.876474 0 0 1 7.6946 73.951554c-0.909706 27.404907-2.198457 54.809814-4.093679 82.176816a207.943733 207.943733 0 0 1-9.476109 51.777459 47.115213 47.115213 0 0 1-17.890893 24.599978 274.693444 274.693444 0 0 1-67.659418 34.113992 359.371953 359.371953 0 0 1-90.402078 19.369167c-9.589822 0.795993-19.217549 1.175038-28.845276 1.781508a16.033576 16.033576 0 0 0-2.350075 0.416949z M0.075809 578.812405c0.34114-3.790444 0.68228-7.201843 0.985515-10.802764a398.83047 398.83047 0 0 1 26.305678-111.439041 434.763875 434.763875 0 0 1 56.136469-104.313006 211.772081 211.772081 0 0 1 45.826463-47.039405 77.097622 77.097622 0 0 1 59.244633-13.607692 567.315686 567.315686 0 0 1 139.905271 42.111828 780.262805 780.262805 0 0 1 106.966317 56.629226 232.922756 232.922756 0 0 1 37.032634 28.200901 102.607307 102.607307 0 0 1 11.636661 13.986736 13.342361 13.342361 0 0 1 0.606471 14.896443 129.367838 129.367838 0 0 1-21.643432 28.579945 698.502938 698.502938 0 0 1-74.747547 66.82552 2076.215455 2076.215455 0 0 1-205.593658 144.036855c-15.161774 9.362396-30.096122 18.952218-45.485323 28.087186a162.155175 162.155175 0 0 1-47.380544 19.634498 60.874523 60.874523 0 0 1-35.668074-1.36456 53.975916 53.975916 0 0 1-25.358068-21.946668 151.162889 151.162889 0 0 1-19.558688-47.34264 309.944569 309.944569 0 0 1-8.831734-58.069595 19.444975 19.444975 0 0 0-0.454853-2.918642z M1154.000539 336.830489a450.001458 450.001458 0 0 1-18.080415 122.734562 551.016779 551.016779 0 0 1-76.22582 164.277823 359.068718 359.068718 0 0 1-41.96021 50.791944c-22.287808 22.325713-47.039404 41.164217-76.377438 53.331541a137.517292 137.517292 0 0 1-51.70165 11.901992 156.317892 156.317892 0 0 1-44.082859-6.33004 317.790787 317.790787 0 0 1-83.162331-38.662525 388.899508 388.899508 0 0 1-71.677288-60.154339 770.597174 770.597174 0 0 1-75.467731-90.288365 333.104179 333.104179 0 0 1-37.449582-63.300407 171.707093 171.707093 0 0 1-5.913092-18.307843 19.179644 19.179644 0 0 1 3.070259-16.336812 114.281873 114.281873 0 0 1 20.430491-22.742661 590.399488 590.399488 0 0 1 68.644933-52.535547c50.185473-33.848661 101.356461-66.14324 154.536383-95.102229a611.967111 611.967111 0 0 1 119.929634-50.640326 367.445598 367.445598 0 0 1 89.454468-15.161774 175.876581 175.876581 0 0 1 59.434155 6.254232c31.119542 9.589822 50.412899 30.740497 59.623677 61.594707a190.05284 190.05284 0 0 1 7.126034 50.564517c-0.075809 2.425884-0.151618 5.230812-0.151618 8.11155z M329.579067 164.630638c0.758089-26.040347 5.155003-48.290251 19.672402-67.5078a136.455968 136.455968 0 0 1 33.621234-30.816306 299.899894 299.899894 0 0 1 72.738612-34.113992 573.228778 573.228778 0 0 1 93.017485-22.742661q29.451746-4.738054 59.130919-7.959931a325.67491 325.67491 0 0 1 57.993786-0.379045 408.192866 408.192866 0 0 1 70.957104 11.030191 249.941848 249.941848 0 0 1 66.408571 25.737112 102.607307 102.607307 0 0 1 29.717077 24.865309 48.972531 48.972531 0 0 1 10.878573 41.0126 146.803879 146.803879 0 0 1-9.817249 30.323548 484.418686 484.418686 0 0 1-43.021534 75.391922 370.061004 370.061004 0 0 1-34.872081 47.039405 551.206301 551.206301 0 0 1-69.440926 62.504414q-37.904436 28.996893-76.756481 56.856653a217.078702 217.078702 0 0 1-54.392865 29.451747 72.20795 72.20795 0 0 1-21.52972 4.472723 58.410735 58.410735 0 0 1-28.314613-7.580887 284.017935 284.017935 0 0 1-51.474224-34.113992 394.660983 394.660983 0 0 1-103.74444-127.510521 175.990294 175.990294 0 0 1-18.686886-55.795329c-1.137133-7.770409-1.591986-15.275488-2.084744-20.16516z "/></svg>'
 }
 
+// 同人文站图标：白底红字 AO3（自绘，没有使用任何官方图片）
+SVG_ICONS.ao3 = '<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><text x="50" y="64" text-anchor="middle" font-family="Verdana, Georgia, sans-serif" font-weight="900" font-size="38" fill="#990000">AO3</text></svg>'
+
 // ===== 桌面图标配置 =====
 var DESKTOP_ICONS = [
   { id: 'wechat',    fa: 'fa-brands fa-weixin',         label: '微信',     action: function() { window.showWechatPage && showWechatPage() } },
@@ -37,10 +40,11 @@ var DESKTOP_ICONS = [
 
 var DESKTOP_PAGE2_ICONS = [
   { id: 'tutorial', img: 'img/wanwan.png', label: '教程', action: function() { window.showTutorialPage && showTutorialPage() } },
-  { id: 'loveDiary', fa: 'fa-solid fa-heart-pulse', label: '恋爱记', action: function() {} },
+{ id: 'loveDiary', fa: 'fa-solid fa-heart-pulse', label: '恋爱记', action: function() { window.showLoveDiaryPage ? window.showLoveDiaryPage() : window.toast('恋爱记文件没加载') } },
   { id: 'wanwanFarm', fa: 'fa-solid fa-seedling', label: '弯弯农场', action: function() {} },
   { id: 'visualnovel', svg: SVG_ICONS.visualnovel, label: '橙光', action: function() { window.showAvgPage && showAvgPage() } },
-  { id: 'terminal', fa: 'fa-solid fa-terminal', label: '终端', action: function() { window.showTerminalPage && showTerminalPage() } }
+  { id: 'terminal', fa: 'fa-solid fa-terminal', label: '终端', action: function() { window.showTerminalPage && showTerminalPage() } },
+  { id: 'ao3', svg: SVG_ICONS.ao3, label: '同人文站', action: function() { window.showAo3Page ? window.showAo3Page() : window.toast('同人文站文件没加载') } }
 ]
 
 var DESKTOP_ICON_PAGES = [DESKTOP_ICONS, DESKTOP_PAGE2_ICONS]
@@ -1400,6 +1404,16 @@ function openMusicWidgetEditor(widgetId) {
   })
 }
 
+// 从纪念日到今天一共多少天，纪念日当天算第 1 天；日期无效返回 null，纪念日在未来显示 0
+function coupleDaysSince(dateStr) {
+  var m = String(dateStr || '').match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!m) return null
+  var start = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+  var now = new Date()
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  return Math.max(0, Math.round((today - start) / 86400000) + 1)
+}
+
 function openCoupleWidgetEditor(widgetId) {
   var widget = _desktopWidgets.find(function(item) { return item.id === widgetId })
   if (!widget || widget.templateId !== 'couple') return
@@ -1410,7 +1424,9 @@ function openCoupleWidgetEditor(widgetId) {
     name2: '小狗神',
     bubbleLeft: '你在左边',
     bubbleRight: '我靠近右',
-    count: '520'
+    count: '520',
+    countMode: 'manual',
+    anniversary: ''
   }, widget.data || {})
   var overlay = document.createElement('div')
   overlay.className = 'sheet-overlay'
@@ -1435,7 +1451,12 @@ function openCoupleWidgetEditor(widgetId) {
       '<label>昵称「右」<input class="input-field" id="couple-editor-name2" value="' + escapeMainHtml(data.name2) + '"></label>' +
       '<label>气泡「左」<input class="input-field" id="couple-editor-bubble-left" value="' + escapeMainHtml(data.bubbleLeft) + '"></label>' +
       '<label>气泡「右」<input class="input-field" id="couple-editor-bubble-right" value="' + escapeMainHtml(data.bubbleRight) + '"></label>' +
-      '<label>计数<input class="input-field" id="couple-editor-count" value="' + escapeMainHtml(data.count || '520') + '" placeholder="520"></label>' +
+      '<label>计数方式<select class="input-field" id="couple-editor-mode">' +
+        '<option value="manual">手动填写</option>' +
+        '<option value="anniversary">纪念日（自动算天数）</option>' +
+      '</select></label>' +
+      '<label id="couple-editor-count-wrap">计数<input class="input-field" id="couple-editor-count" value="' + escapeMainHtml(data.count || '520') + '" placeholder="520"></label>' +
+      '<label id="couple-editor-date-wrap">纪念日<input class="input-field" id="couple-editor-date" type="date" value="' + escapeMainHtml(data.anniversary || '') + '"></label>' +
       '<div class="angel-editor-actions">' +
         '<button class="btn-pill" id="couple-editor-cancel" type="button">取消</button>' +
         '<button class="btn-pill angel-editor-save" id="couple-editor-save" type="button">保存</button>' +
@@ -1454,6 +1475,15 @@ function openCoupleWidgetEditor(widgetId) {
   }
   overlay.addEventListener('click', close)
   modal.querySelector('#couple-editor-cancel').addEventListener('click', close)
+  var coupleModeSelect = modal.querySelector('#couple-editor-mode')
+  var syncCoupleMode = function() {
+    var isAnniversary = coupleModeSelect.value === 'anniversary'
+    modal.querySelector('#couple-editor-count-wrap').style.display = isAnniversary ? 'none' : ''
+    modal.querySelector('#couple-editor-date-wrap').style.display = isAnniversary ? '' : 'none'
+  }
+  coupleModeSelect.value = data.countMode === 'anniversary' ? 'anniversary' : 'manual'
+  coupleModeSelect.addEventListener('change', syncCoupleMode)
+  syncCoupleMode()
   modal.querySelector('#couple-editor-left-avatar').addEventListener('click', function() {
     window.showImagePicker(function(imageUrl) {
       data.avatar1 = imageUrl
@@ -1469,6 +1499,12 @@ function openCoupleWidgetEditor(widgetId) {
     })
   })
   modal.querySelector('#couple-editor-save').addEventListener('click', async function() {
+    var coupleMode = coupleModeSelect.value === 'anniversary' ? 'anniversary' : 'manual'
+    var coupleDate = modal.querySelector('#couple-editor-date').value
+    if (coupleMode === 'anniversary' && !coupleDate) {
+      if (window.toast) window.toast('请先选择纪念日')
+      return
+    }
     widget.data = Object.assign({}, widget.data || {}, {
       avatar1: data.avatar1 || 'img/ava-01.jpg',
       avatar2: data.avatar2 || 'img/ava-02.jpg',
@@ -1476,7 +1512,9 @@ function openCoupleWidgetEditor(widgetId) {
       name2: modal.querySelector('#couple-editor-name2').value.trim() || '小狗神',
       bubbleLeft: modal.querySelector('#couple-editor-bubble-left').value.trim() || '你在左边',
       bubbleRight: modal.querySelector('#couple-editor-bubble-right').value.trim() || '我靠近右',
-      count: modal.querySelector('#couple-editor-count').value.trim() || '520'
+      count: modal.querySelector('#couple-editor-count').value.trim() || '520',
+      countMode: coupleMode,
+      anniversary: coupleDate || ''
     })
     await saveDesktopWidgets()
     var liveWidget = document.querySelector('.desktop-widget[data-id="' + widget.id + '"]')
@@ -2285,8 +2323,9 @@ function buildDesktopWidgetInner(widget) {
     var coupleName1 = data.name1 === '月亮O.o' ? '弯弯O.o' : (data.name1 || '弯弯O.o')
     var coupleBubbleLeft = data.bubbleLeft || '你在左边'
     var coupleBubbleRight = data.bubbleRight || '我靠近右'
-    var coupleCount = data.count || '520'
-    return '<div class="couple-bubbles-row"><div class="couple-bubble-item couple-bubble-left-note"><span>' + escapeMainHtml(coupleBubbleLeft) + '</span></div><div class="couple-bubble-item couple-bubble-right-note"><span>' + escapeMainHtml(coupleBubbleRight) + '</span></div></div><div class="couple-avatars-main"><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar1) + '" alt=""></div><div class="name">' + escapeMainHtml(coupleName1) + '</div></div><div class="couple-ekg"><svg viewBox="0 0 64 22" preserveAspectRatio="none"><polyline points="0,11 6,11 9,14 13,8 17,11 21,11 25,2 31,20 35,11 64,11" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg></div><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar2) + '" alt=""></div><div class="name">' + escapeMainHtml(data.name2 || '小狗神') + '</div></div></div><div class="couple-days-area"><div class="couple-days-label">我们已经相爱</div><div class="couple-days-value">' + escapeMainHtml(coupleCount) + ' days</div></div>'
+    var coupleDays = data.countMode === 'anniversary' ? coupleDaysSince(data.anniversary) : null
+    var coupleCount = coupleDays !== null ? String(coupleDays) : (data.count || '520')
+    return '<div class="couple-bubbles-row"><div class="couple-bubble-item couple-bubble-left-note"><span>' + escapeMainHtml(coupleBubbleLeft) + '</span></div><div class="couple-bubble-item couple-bubble-right-note"><span>' + escapeMainHtml(coupleBubbleRight) + '</span></div></div><div class="couple-avatars-main"><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar1) + '" alt=""></div><div class="name">' + escapeMainHtml(coupleName1) + '</div></div><div class="couple-ekg"><svg viewBox="0 0 64 22" preserveAspectRatio="none"><polyline points="0,11 6,11 9,14 13,8 17,11 21,11 25,2 31,20 35,11 64,11" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg></div><div class="circle-photo"><div class="img-ring"><img class="img" src="' + escapeMainHtml(coupleAvatar2) + '" alt=""></div><div class="name">' + escapeMainHtml(data.name2 || '小狗神') + '</div></div></div><div class="couple-days-area"><div class="couple-days-label">正式在一起已经</div><div class="couple-days-value">' + escapeMainHtml(coupleCount) + ' days</div></div>'
   }
   if (widget.templateId === 'calendar') {
     var calAvatar = data.avatar || 'img/ava-00.jpg'
