@@ -21223,7 +21223,7 @@ function buildCallOutputFormat(callType) {
 - "speech"：你说的话（语音内容），自然口语，像真人通话一样
 
 ✅ 正确示例：{"scene":"房间里很安静，偶尔传来翻书的声音","speech":"喂？怎么啦，突然打电话过来"}
-❌ 错误：好的，我来回复：{"scene":"...","speech":"..."}`
+❌ 错误：好的，我来回复：{"scene":"...","speech":"..."}${window.ProseGuard && window.ProseGuard.isEnabled('wechat') ? '\n\n【文风】\n' + window.ProseGuard.styleRule({ short: true, prefix: '- ' }) : ''}`
 }
 
 // ===== 语音通话专属规则 =====
@@ -21741,6 +21741,13 @@ async function sendCallAIRequest(page) {
     if (_callState === 'idle') return
 
     const parsed = extractCallJson(raw)
+    if (window.ProseGuard && window.ProseGuard.isEnabled('wechat') && parsed.speech) {
+      try {
+        const pg = await window.ProseGuard.polishText(parsed.speech, { allow: 0, maxUnits: 2, protect: [/【[^】]*】/] })
+        if (pg.fixed) parsed.speech = pg.text
+      } catch (e) { console.warn('[call] 文风润色失败，使用原文', e) }
+      if (_callState === 'idle') return
+    }
 
     _callHistory.push({
       role: 'assistant',
