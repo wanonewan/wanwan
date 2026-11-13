@@ -18804,12 +18804,72 @@ function openChatBeautyEditor(listPage, preset) {
 
 // ===== 表情包库（全局共享） =====
 // 数据访问辅助
+// 表情/分组排序：优先用 sortOrder，没有就按 id（旧数据保持原顺序）
+function stickerOrderKey(x) {
+  return Number.isFinite(x?.sortOrder) ? x.sortOrder : (Number(x?.id) || 0)
+}
+function sortByStickerOrder(list) {
+  return (list || []).slice().sort((a, b) => stickerOrderKey(a) - stickerOrderKey(b) || (a.id - b.id))
+}
+
 async function getAllStickerCategories() {
-  return await db.stickerCategories.orderBy('id').toArray()
+  return sortByStickerOrder(await db.stickerCategories.orderBy('id').toArray())
 }
 
 async function getStickersInCategory(catId) {
-  return await db.stickers.where('categoryId').equals(catId).toArray()
+  return sortByStickerOrder(await db.stickers.where('categoryId').equals(catId).toArray())
+}
+
+// 返回「放到该分组最前面 count 个」时的起始排序值
+async function getStickerFrontStart(catId, count) {
+  let min = 0
+  let has = false
+  await db.stickers.where('categoryId').equals(catId).each(s => {
+    const k = stickerOrderKey(s)
+    if (!has || k < min) { min = k; has = true }
+  })
+  return min - Math.max(1, count || 1)
+}
+
+// 把一个表情移到所在分组最前，返回新排序值
+async function moveStickerToFront(stickerId) {
+  const s = await db.stickers.get(stickerId)
+  if (!s) throw new Error('表情不存在')
+  const key = await getStickerFrontStart(s.categoryId, 1)
+  await db.stickers.update(stickerId, { sortOrder: key })
+  return key
+}
+
+// 按格子当前的显示顺序保存排序（只写有变化的，避免重写大量 base64 图片）
+async function persistStickerOrder(container) {
+  const ids = [...container.querySelectorAll('.sl-tile[data-id]')].map(el => parseInt(el.dataset.id))
+  const keys = container._slKeys || (container._slKeys = {})
+  for (let i = 0; i < ids.length; i++) {
+    if (keys[ids[i]] === i) continue
+    await db.stickers.update(ids[i], { sortOrder: i })
+    keys[ids[i]] = i
+  }
+}
+
+// 分组左移 / 右移 / 移到最前
+async function moveStickerCategory(catId, action, page) {
+  const cats = await getAllStickerCategories()
+  const from = cats.findIndex(c => c.id === catId)
+  if (from < 0) return
+  let to = from
+  if (action === 'left') to = from - 1
+  else if (action === 'right') to = from + 1
+  else if (action === 'front') to = 0
+  if (to < 0 || to >= cats.length || to === from) {
+    window.toast?.(action === 'right' ? '已经是最后一个了' : '已经是第一个了')
+    return
+  }
+  const [moved] = cats.splice(from, 1)
+  cats.splice(to, 0, moved)
+  for (let i = 0; i < cats.length; i++) {
+    if (stickerOrderKey(cats[i]) !== i) await db.stickerCategories.update(cats[i].id, { sortOrder: i })
+  }
+  if (page) await renderStickerLibraryPage(page)
 }
 
 async function getAllStickers() {
@@ -18900,7 +18960,20 @@ async function openStickerLibraryPage() {
     <div class="sl-content" id="sl-content"></div>
   `
   window.openPage(page)
-  page.querySelector('#btn-sl-back').addEventListener('click', () => window.closePage('sticker-library-page'))
+    page.querySelector('#btn-sl-back').addEventListener('click', () => window.closePage('sticker-library-page'))
+  // 排序模式：先点要移动的表情，再点要放在它前面的表情（点最后的「添加」格子 = 放到最后）
+  page.querySelector('#btn-sl-add-cat').insertAdjacentHTML('beforebegin',
+    '<button class="btn-icon" id="btn-sl-sort" title="排序"><i class="fa-solid fa-sort"></i></button>')
+  page.querySelector('.page-header').insertAdjacentHTML('afterend',
+    '<div class="sl-sort-hint" id="sl-sort-hint" style="display:none">排序模式：先点要移动的表情，再点要放在它前面的表情；点最后的“添加”格子＝放到最后。长按表情可“移到最前”，长按分组可调整分组顺序。</div>')
+  page.querySelector('#btn-sl-sort').addEventListener('click', () => {
+    const on = !page.classList.contains('sl-sorting')
+    page.classList.toggle('sl-sorting', on)
+    page._slPickId = null
+    page.querySelectorAll('.sl-tile.sl-picked').forEach(t => t.classList.remove('sl-picked'))
+    page.querySelector('#sl-sort-hint').style.display = on ? '' : 'none'
+    page.querySelector('#btn-sl-sort').classList.toggle('active', on)
+  })
   page.querySelector('#btn-sl-add-cat').addEventListener('click', () => promptAddStickerCategory(page))
   page.querySelector('#btn-sl-add-sticker').addEventListener('click', () => {
     const catId = parseInt(page.dataset.activeCat)
@@ -18970,6 +19043,9 @@ async function renderStickerLibraryPage(page) {
 
 async function renderStickerGrid(container, catId, page) {
   const stickers = await getStickersInCategory(catId)
+  container._slKeys = {}
+  stickers.forEach(s => { container._slKeys[s.id] = stickerOrderKey(s) })
+  if (page) page._slPickId = null
   const tiles = stickers.map(s => `
     <div class="sl-tile" data-id="${s.id}">
       <img src="${s.image}" alt="${wcEscHtml(s.name)}" loading="lazy">
@@ -18985,7 +19061,18 @@ async function renderStickerGrid(container, catId, page) {
       </button>
     </div>
   `
-  container.querySelector('#sl-add-tile').addEventListener('click', () => {
+    container.querySelector('#sl-add-tile').addEventListener('click', async () => {
+    if (page?.classList.contains('sl-sorting') && page._slPickId) {
+      // 排序模式下已选中某个表情：放到最后
+      const picked = container.querySelector(`.sl-tile[data-id="${page._slPickId}"]`)
+      page._slPickId = null
+      if (picked) {
+        picked.classList.remove('sl-picked')
+        container.querySelector('.sl-grid').insertBefore(picked, container.querySelector('#sl-add-tile'))
+        try { await persistStickerOrder(container) } catch (e) { window.toast('排序保存失败，请重试') }
+      }
+      return
+    }
     openStickerImportDialog(catId, () => renderStickerLibraryPage(page))
   })
   container.querySelectorAll('.sl-tile[data-id]').forEach(tile => {
