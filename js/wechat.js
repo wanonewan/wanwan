@@ -4891,6 +4891,26 @@ function buildWechatRenderTimeline(messages, traces) {
   )
 }
 
+// AI 发的表情包消息只存了名字、没存图片：渲染前按名字从挂载库补图（只补当前窗口里用到的）
+const _wechatStickerMapCache = new Map()
+async function getStickerMapForMessages(chatId, msgs, charName) {
+  const need = new Set()
+  for (const m of msgs || []) {
+    if (m.stickerImage || !m.content || String(m.content).indexOf('的表情包：') < 0) continue
+    const p = parseMsgType(m.content, charName)
+    const name = p.type === 'sticker' ? String(p.data?.name || '').trim() : ''
+    if (name) need.add(name)
+  }
+  if (!need.size) return {}
+  let hit = _wechatStickerMapCache.get(chatId)
+  if (!hit || Date.now() - hit.at > 60000 || [...need].some(n => !(n in hit.map))) {
+    hit = { at: Date.now(), map: await getMountedStickerMap(chatId) }
+    _wechatStickerMapCache.set(chatId, hit)
+  }
+  const out = {}
+  need.forEach(n => { if (hit.map[n]) out[n] = hit.map[n] })
+  return out
+}
 // 加载并渲染消息
 async function loadChatMessages(page, chatId, options = {}) {
   const container = page.querySelector('#chat-messages')
@@ -4915,7 +4935,7 @@ async function loadChatMessages(page, chatId, options = {}) {
   const mcpTraces = await getMcpToolTracesForConversation('chat', chatId, traceLowerBound)
   const charName = getWechatDisplayName(char)
   // 首屏消息已经携带 stickerImage；这里不读取整套挂载表情图片，避免大表情库拖慢聊天打开。
-  const stickerMap = {}
+  const stickerMap = await getStickerMapForMessages(chatId, msgs, charName)
   const visibleMsgs = msgs.filter(m => parseMsgType(m.content, charName).type !== 'status-update')
   const oldestVisible = visibleMsgs[0] || null
   const hasEarlier = oldestVisible ? await hasEarlierChatMessages(chatId, oldestVisible) : false
